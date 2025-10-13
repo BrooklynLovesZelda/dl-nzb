@@ -1,7 +1,7 @@
 use config::{Config as ConfigLib, Environment, File};
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
 use std::env;
+use std::path::{Path, PathBuf};
 
 use crate::error::{ConfigError, DlNzbError};
 
@@ -28,16 +28,16 @@ fn expand_tilde(path: &Path) -> PathBuf {
 pub struct Config {
     #[serde(default)]
     pub usenet: UsenetConfig,
-    
+
     #[serde(default)]
     pub download: DownloadConfig,
-    
+
     #[serde(default)]
     pub memory: MemoryConfig,
-    
+
     #[serde(default)]
     pub post_processing: PostProcessingConfig,
-    
+
     #[serde(default)]
     pub logging: LoggingConfig,
 }
@@ -59,19 +59,15 @@ pub struct UsenetConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DownloadConfig {
     pub dir: PathBuf,
-    pub temp_dir: PathBuf,
     pub create_subfolders: bool,
-    pub overwrite_existing: bool,
     pub user_agent: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryConfig {
     pub max_segments_in_memory: usize,
-    pub stream_to_disk: bool,
     pub io_buffer_size: usize,
     pub max_concurrent_files: usize,
-    pub segment_retry_buffer: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,6 +76,7 @@ pub struct PostProcessingConfig {
     pub auto_extract_rar: bool,
     pub delete_rar_after_extract: bool,
     pub delete_par2_after_repair: bool,
+    pub deobfuscate_file_names: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,16 +90,16 @@ pub struct LoggingConfig {
 impl Default for UsenetConfig {
     fn default() -> Self {
         Self {
-            server: "news.example.com".to_string(),
-            port: 119,
+            server: String::new(),
+            port: 563, // Default SSL port
             username: String::new(),
             password: String::new(),
-            ssl: false,
+            ssl: true, // Default to SSL
             verify_ssl_certs: true,
-            connections: 20,
-            timeout: 30,
-            retry_attempts: 3,
-            retry_delay: 1000,
+            connections: 30,   // Optimized default
+            timeout: 45,       // Longer for large segments
+            retry_attempts: 2, // Faster failover
+            retry_delay: 500,  // Quick retries
         }
     }
 }
@@ -111,9 +108,7 @@ impl Default for DownloadConfig {
     fn default() -> Self {
         Self {
             dir: PathBuf::from("downloads"),
-            temp_dir: PathBuf::from(".dl-nzb-temp"),
             create_subfolders: true,
-            overwrite_existing: false,
             user_agent: format!("dl-nzb/{}", env!("CARGO_PKG_VERSION")),
         }
     }
@@ -123,10 +118,8 @@ impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
             max_segments_in_memory: 100,
-            stream_to_disk: true,
-            io_buffer_size: 4 * 1024 * 1024, // 4MB
-            max_concurrent_files: 5,
-            segment_retry_buffer: 50,
+            io_buffer_size: 8 * 1024 * 1024, // 8MB (optimized)
+            max_concurrent_files: 10,
         }
     }
 }
@@ -138,6 +131,7 @@ impl Default for PostProcessingConfig {
             auto_extract_rar: true,
             delete_rar_after_extract: false,
             delete_par2_after_repair: false,
+            deobfuscate_file_names: true,
         }
     }
 }
@@ -194,7 +188,7 @@ impl ConfigBuilder {
             .add_source(
                 Environment::with_prefix(prefix)
                     .separator("_")
-                    .try_parsing(true)
+                    .try_parsing(true),
             )
             .build()
             .unwrap();
@@ -210,7 +204,6 @@ impl ConfigBuilder {
 
         // Expand tilde in paths
         config.download.dir = expand_tilde(&config.download.dir);
-        config.download.temp_dir = expand_tilde(&config.download.temp_dir);
         if let Some(log_file) = config.logging.file.as_ref() {
             config.logging.file = Some(expand_tilde(log_file));
         }
@@ -223,11 +216,9 @@ impl ConfigBuilder {
 impl Config {
     /// Get the standard config file path
     pub fn config_path() -> Result<PathBuf> {
-        let config_dir = dirs::config_dir().ok_or_else(|| {
-            ConfigError::Invalid {
-                field: "config_dir".to_string(),
-                reason: "Could not determine config directory".to_string(),
-            }
+        let config_dir = dirs::config_dir().ok_or_else(|| ConfigError::Invalid {
+            field: "config_dir".to_string(),
+            reason: "Could not determine config directory".to_string(),
         })?;
         Ok(config_dir.join("dl-nzb").join("config.toml"))
     }
@@ -244,7 +235,10 @@ impl Config {
         } else {
             // Create standard config file with defaults if it doesn't exist
             if !standard_config.exists() {
-                tracing::debug!("Config file not found, creating default at: {}", standard_config.display());
+                tracing::debug!(
+                    "Config file not found, creating default at: {}",
+                    standard_config.display()
+                );
 
                 // Ensure directory exists
                 if let Some(parent) = standard_config.parent() {
@@ -254,7 +248,10 @@ impl Config {
                 // Create default config file
                 Self::create_sample(&standard_config)?;
 
-                println!("📝 Created default configuration at: {}", standard_config.display());
+                println!(
+                    "📝 Created default configuration at: {}",
+                    standard_config.display()
+                );
                 println!("⚙️  Please edit this file with your Usenet server credentials.");
                 println!();
             }
@@ -278,38 +275,46 @@ impl Config {
         let sample = Self::default();
         let content = toml::to_string_pretty(&sample)
             .map_err(|e| ConfigError::ParseError(format!("Failed to serialize config: {}", e)))?;
-        
+
         // Add helpful comments
         let commented_content = format!(
             r#"# dl-nzb Configuration File
-# 
+#
 # This file configures the dl-nzb Usenet downloader.
 # All settings can be overridden via environment variables with the DL_NZB_ prefix.
 # For example: DL_NZB_USENET_SERVER=news.example.com
+#
+# REQUIRED: Set your Usenet server details below
 
 {}
 
-# Additional configuration examples:
+# Configuration Guide:
 #
 # [usenet]
-# server = "news.usenetserver.com"
-# port = 563  # Use 563 for SSL
-# ssl = true
-# connections = 50  # Increase for faster downloads
+# server       - Your Usenet provider's server address (REQUIRED)
+# port         - Usually 563 for SSL, 119 for non-SSL
+# username     - Your Usenet account username (REQUIRED)
+# password     - Your Usenet account password (REQUIRED)
+# ssl          - Use encrypted SSL/TLS connection (recommended)
+# connections  - Number of connections (30-50 typical, check your provider's limit)
+# timeout      - Connection timeout in seconds
+# retry_attempts - Number of times to retry failed downloads
 #
 # [download]
-# dir = "/path/to/downloads"
-# create_subfolders = true  # Create subfolders based on NZB name
+# dir               - Where to save downloads
+# create_subfolders - Create a subfolder for each NZB file
 #
 # [memory]
-# max_segments_in_memory = 200  # Increase if you have more RAM
-# io_buffer_size = 8388608  # 8MB buffers for better performance
+# max_segments_in_memory - How many segments to buffer (affects memory usage)
+# io_buffer_size        - Buffer size in bytes (8MB recommended for performance)
+# max_concurrent_files  - How many files to download simultaneously
 #
 # [post_processing]
-# auto_par2_repair = true              # Verify and repair files with PAR2
-# auto_extract_rar = true              # Extract RAR archives (using native library)
-# delete_rar_after_extract = true      # Save disk space after extraction
-# delete_par2_after_repair = true      # Clean up PAR2 files after repair
+# auto_par2_repair        - Automatically verify/repair with PAR2 files
+# auto_extract_rar        - Automatically extract RAR archives
+# delete_rar_after_extract - Delete RAR files after successful extraction
+# delete_par2_after_repair - Delete PAR2 files after successful repair
+# deobfuscate_file_names  - Rename obfuscated files to meaningful names
 "#,
             content
         );
@@ -321,7 +326,7 @@ impl Config {
     /// Validate configuration
     pub fn validate(&self) -> Result<()> {
         // Validate Usenet settings
-        if self.usenet.server.is_empty() || self.usenet.server == "news.example.com" {
+        if self.usenet.server.is_empty() {
             return Err(ConfigError::NoServer.into());
         }
 
@@ -368,14 +373,13 @@ impl Config {
     /// Ensure required directories exist
     pub fn ensure_dirs(&self) -> Result<()> {
         std::fs::create_dir_all(&self.download.dir)?;
-        std::fs::create_dir_all(&self.download.temp_dir)?;
-        
+
         if let Some(log_file) = &self.logging.file {
             if let Some(parent) = log_file.parent() {
                 std::fs::create_dir_all(parent)?;
             }
         }
-        
+
         Ok(())
     }
 
@@ -420,15 +424,17 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = Config::default();
-        assert_eq!(config.usenet.connections, 20);
-        assert!(config.memory.stream_to_disk);
+        assert_eq!(config.usenet.connections, 30);
+        assert_eq!(config.memory.io_buffer_size, 8 * 1024 * 1024);
     }
 
     #[test]
     fn test_config_validation() {
         let mut config = Config::default();
+        // Default config should fail validation (no server)
         assert!(config.validate().is_err());
 
+        // Set required fields
         config.usenet.server = "news.example.org".to_string();
         config.usenet.username = "user".to_string();
         config.usenet.password = "pass".to_string();

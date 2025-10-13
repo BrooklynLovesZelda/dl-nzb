@@ -2,15 +2,15 @@ use bytes::Bytes;
 use futures::stream::{self, StreamExt};
 use indicatif::ProgressBar;
 use std::path::PathBuf;
-use std::time::{Instant, Duration};
+use std::time::{Duration, Instant};
 use tokio::fs::File;
 use tokio::io::{AsyncWriteExt, BufWriter};
 
-use crate::nntp::{NntpPool, NntpPoolBuilder, NntpPoolExt};
+use super::nzb::{Nzb, NzbFile};
 use crate::config::Config;
 use crate::error::{DlNzbError, DownloadError};
+use crate::nntp::{NntpPool, NntpPoolBuilder, NntpPoolExt};
 use crate::progress;
-use super::nzb::{Nzb, NzbFile};
 
 type Result<T> = std::result::Result<T, DlNzbError>;
 
@@ -34,7 +34,6 @@ struct SegmentResult {
 
 /// Optimized downloader using connection pooling and streaming
 pub struct Downloader {
-    config: Config,
     pool: NntpPool,
 }
 
@@ -45,20 +44,15 @@ impl Downloader {
             .max_size(config.usenet.connections as usize)
             .build()?;
 
-        Ok(Self {
-            config,
-            pool,
-        })
-    }
-
-    /// Pre-warm the connection pool for better initial performance
-    pub async fn warm_up(&self) -> Result<()> {
-        let target = (self.config.usenet.connections / 2).max(1) as usize;
-        self.pool.warm_up(target).await
+        Ok(Self { pool })
     }
 
     /// Download all files from an NZB, returns results and progress bar for reuse
-    pub async fn download_nzb(&self, nzb: &Nzb, config: Config) -> Result<(Vec<DownloadResult>, ProgressBar)> {
+    pub async fn download_nzb(
+        &self,
+        nzb: &Nzb,
+        config: Config,
+    ) -> Result<(Vec<DownloadResult>, ProgressBar)> {
         config.ensure_dirs()?;
 
         // Get all files to download (no separation between main and PAR2)
@@ -73,30 +67,54 @@ impl Downloader {
         }
 
         // Create clean progress bar using centralized progress module
-        let total_bytes: u64 = all_files.iter()
+        let total_bytes: u64 = all_files
+            .iter()
             .flat_map(|f| &f.segments.segment)
             .map(|s| s.bytes)
             .sum();
 
         let total_files = all_files.len();
-        let progress_bar = progress::create_progress_bar(total_bytes, progress::ProgressStyle::Download);
+        let progress_bar =
+            progress::create_progress_bar(total_bytes, progress::ProgressStyle::Download);
         progress_bar.set_message(format!("({}/{})", 0, total_files));
 
         // Download all files concurrently
-        let results = self.download_files_concurrent_with_config(&all_files, progress_bar.clone(), config).await?;
+        let results = self
+            .download_files_concurrent_with_config(&all_files, progress_bar.clone(), config)
+            .await?;
 
-        // Finish the progress bar with clean message using centralized formatting
+        // Finish the progress bar with clean formatting
         let total_downloaded: u64 = results.iter().map(|r| r.size).sum();
         let failed_files = results.iter().filter(|r| r.segments_failed > 0).count();
 
-        let summary = progress::format_download_summary(
-            all_files.len(),
-            all_files.len(),
-            total_downloaded,
-            failed_files,
-        );
-        progress_bar.set_message(summary);
-        progress_bar.finish();
+        progress_bar.set_position(total_bytes);
+
+        if failed_files == 0 {
+            progress_bar.finish_with_message(format!(
+                "({}/{})  ",
+                all_files.len(),
+                all_files.len()
+            ));
+
+            // Print download summary on new line with color
+            println!(
+                "  └─ \x1b[32m✓ Downloaded {}\x1b[0m",
+                human_bytes::human_bytes(total_downloaded as f64)
+            );
+        } else {
+            progress_bar.finish_with_message(format!(
+                "({}/{})  ",
+                all_files.len(),
+                all_files.len()
+            ));
+
+            println!(
+                "  └─ \x1b[33m! Downloaded {} ({} file{} with errors)\x1b[0m",
+                human_bytes::human_bytes(total_downloaded as f64),
+                failed_files,
+                if failed_files == 1 { "" } else { "s" }
+            );
+        }
 
         Ok((results, progress_bar))
     }
@@ -108,26 +126,35 @@ impl Downloader {
         progress_bar: ProgressBar,
         config: Config,
     ) -> Result<Vec<DownloadResult>> {
+        let total_files = files.len();
+        let completed_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
         let download_futures = files.iter().map(|file| {
             let pool = self.pool.clone();
             let config = config.clone();
             let file = (*file).clone();
             let progress = progress_bar.clone();
+            let completed = completed_count.clone();
 
             async move {
-                Self::download_file_with_pool(
-                    file,
-                    config,
-                    pool,
-                    progress,
-                ).await
+                let result =
+                    Self::download_file_with_pool(file, config, pool, progress.clone()).await;
+
+                // Update file counter (only update every 5 files to reduce overhead)
+                let count = completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if count % 5 == 0 || count == total_files {
+                    progress.set_message(format!("({}/{})", count, total_files));
+                }
+
+                result
             }
         });
 
         // Process downloads with controlled concurrency
-        // Use more file-level parallelism to keep all connections busy
+        // Use config value for file-level parallelism to better utilize connection pool
+        let file_concurrency = config.memory.max_concurrent_files.min(files.len());
         let results: Vec<Result<DownloadResult>> = stream::iter(download_futures)
-            .buffer_unordered((config.usenet.connections as usize).min(files.len()))
+            .buffer_unordered(file_concurrency)
             .collect()
             .await;
 
@@ -174,31 +201,32 @@ impl Downloader {
                 // Retry up to 3 times
                 for attempt in 0..3 {
                     // Get connection from pool with timeout
-                    let mut conn = match tokio::time::timeout(
-                        Duration::from_secs(30),
-                        pool.get_connection()
-                    ).await {
-                        Ok(Ok(conn)) => conn,
-                        Ok(Err(_)) | Err(_) => {
-                            if attempt == 2 {
-                                // Last attempt failed
-                                progress.inc(expected_bytes);
-                                return Ok(SegmentResult {
-                                    segment_number,
-                                    data: None,
-                                });
+                    let mut conn =
+                        match tokio::time::timeout(Duration::from_secs(30), pool.get_connection())
+                            .await
+                        {
+                            Ok(Ok(conn)) => conn,
+                            Ok(Err(_)) | Err(_) => {
+                                if attempt == 2 {
+                                    // Last attempt failed
+                                    progress.inc(expected_bytes);
+                                    return Ok(SegmentResult {
+                                        segment_number,
+                                        data: None,
+                                    });
+                                }
+                                // Small delay before retry to avoid overwhelming server
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                                continue;
                             }
-                            // Small delay before retry to avoid overwhelming server
-                            tokio::time::sleep(Duration::from_millis(100)).await;
-                            continue;
-                        }
-                    };
+                        };
 
                     // Download segment with timeout
                     let download_result = tokio::time::timeout(
                         Duration::from_secs(60),
-                        conn.download_segment(&message_id, &group)
-                    ).await;
+                        conn.download_segment(&message_id, &group),
+                    )
+                    .await;
 
                     match download_result {
                         Ok(Ok(data)) => {
@@ -241,10 +269,12 @@ impl Downloader {
             .await;
 
         // Process results and write to file
+        // Pre-allocate Vec for segment data (faster than HashMap)
+        let total_segments = file.segments.segment.len();
+        let mut segment_data: Vec<Option<Bytes>> = vec![None; total_segments];
         let mut segments_downloaded = 0;
         let mut segments_failed = 0;
         let mut actual_size = 0u64;
-        let mut segment_data = std::collections::HashMap::new();
 
         for result in segment_results {
             match result {
@@ -252,7 +282,12 @@ impl Downloader {
                     if let Some(data) = segment_result.data {
                         segments_downloaded += 1;
                         actual_size += data.len() as u64;
-                        segment_data.insert(segment_result.segment_number, data);
+                        // Segments are 1-indexed, Vec is 0-indexed
+                        if segment_result.segment_number > 0
+                            && segment_result.segment_number <= total_segments as u32
+                        {
+                            segment_data[(segment_result.segment_number - 1) as usize] = Some(data);
+                        }
                     } else {
                         segments_failed += 1;
                     }
@@ -261,11 +296,9 @@ impl Downloader {
             }
         }
 
-        // Write segments in order
-        for i in 1..=file.segments.segment.len() as u32 {
-            if let Some(data) = segment_data.get(&i) {
-                writer.write_all(data).await?;
-            }
+        // Write segments in order (Vec iteration is faster than HashMap lookups)
+        for data in segment_data.into_iter().flatten() {
+            writer.write_all(&data).await?;
         }
 
         // Ensure all data is written
@@ -289,5 +322,4 @@ impl Downloader {
             average_speed,
         })
     }
-
 }

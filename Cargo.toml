@@ -1,7 +1,20 @@
 [package]
 name = "dl-nzb"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
+rust-version = "1.85.0"
+authors = ["Zeph <zeph@example.com>"]
+description = "A fast, modern NZB downloader with built-in PAR2 repair and RAR extraction"
+readme = "README.md"
+homepage = "https://github.com/zephleggett/dl-nzb"
+repository = "https://github.com/zephleggett/dl-nzb"
+license = "GPL-2.0"
+keywords = ["nzb", "usenet", "downloader", "nntp", "par2"]
+categories = ["command-line-utilities", "network-programming"]
+
+[lints.rust]
+rust_2024_compatibility = { level = "warn", priority = -1 }
+unsafe_op_in_unsafe_fn = "warn"
 
 [lib]
 name = "dl_nzb"

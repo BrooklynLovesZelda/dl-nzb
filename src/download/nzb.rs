@@ -1,6 +1,7 @@
+pub use nzb_rs::Nzb as NzbRs;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-pub use nzb_rs::{Nzb as NzbRs};
+use std::str::FromStr;
 
 use crate::error::{DlNzbError, NzbError};
 
@@ -59,37 +60,45 @@ pub struct Nzb {
 impl Nzb {
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
         let content = std::fs::read_to_string(path)?;
-        Self::from_str(&content)
+        content.parse()
     }
 
-    pub fn from_str(content: &str) -> Result<Self> {
+    fn parse_content(content: &str) -> Result<Self> {
         let inner = NzbRs::parse(content)
             .map_err(|e| NzbError::ParseError(format!("Failed to parse NZB: {}", e)))?;
 
         // Convert nzb-rs structures to our compatible structures
-        let files = inner.files.iter().map(|file| {
-            let segments = file.segments.iter().map(|segment| {
-                NzbSegment {
-                    bytes: segment.size as u64,
-                    number: segment.number,
-                    message_id: segment.message_id.clone(),
-                }
-            }).collect();
+        let files = inner
+            .files
+            .iter()
+            .map(|file| {
+                let segments = file
+                    .segments
+                    .iter()
+                    .map(|segment| NzbSegment {
+                        bytes: segment.size as u64,
+                        number: segment.number,
+                        message_id: segment.message_id.clone(),
+                    })
+                    .collect();
 
-            let groups = file.groups.iter().map(|group| {
-                NzbGroup {
-                    name: group.clone(),
-                }
-            }).collect();
+                let groups = file
+                    .groups
+                    .iter()
+                    .map(|group| NzbGroup {
+                        name: group.clone(),
+                    })
+                    .collect();
 
-            NzbFile {
-                poster: file.poster.clone(),
-                date: file.posted_at.timestamp() as u64,
-                subject: file.subject.clone(),
-                groups: NzbGroups { group: groups },
-                segments: NzbSegments { segment: segments },
-            }
-        }).collect();
+                NzbFile {
+                    poster: file.poster.clone(),
+                    date: file.posted_at.timestamp() as u64,
+                    subject: file.subject.clone(),
+                    groups: NzbGroups { group: groups },
+                    segments: NzbSegments { segment: segments },
+                }
+            })
+            .collect();
 
         Ok(Nzb { files })
     }
@@ -99,14 +108,16 @@ impl Nzb {
     }
 
     pub fn total_size(&self) -> u64 {
-        self.files.iter()
+        self.files
+            .iter()
             .flat_map(|file| &file.segments.segment)
             .map(|segment| segment.bytes)
             .sum()
     }
 
     pub fn total_segments(&self) -> usize {
-        self.files.iter()
+        self.files
+            .iter()
             .map(|file| file.segments.segment.len())
             .sum()
     }
@@ -119,7 +130,14 @@ impl Nzb {
             .and_then(|caps| caps.get(1))
             .map(|m| m.as_str().to_string())
     }
+}
 
+impl FromStr for Nzb {
+    type Err = DlNzbError;
+
+    fn from_str(s: &str) -> Result<Self> {
+        Self::parse_content(s)
+    }
 }
 
 #[cfg(test)]

@@ -75,7 +75,8 @@ fn main() {
                 "-DPARPAR_ENABLE_HASHER_MD5CRC",
                 "-DPARPAR_INVERT_SUPPORT",
                 "-DPARPAR_SLIM_GF16",
-                "-g", "-O2",
+                "-g",
+                "-O2",
                 "-c",
                 "-o",
             ])
@@ -95,7 +96,9 @@ fn main() {
         std::fs::create_dir_all(&temp_dir).unwrap();
 
         // Extract libpar2.a
-        let libpar2_path = par2_root.join("libpar2.a").canonicalize()
+        let libpar2_path = par2_root
+            .join("libpar2.a")
+            .canonicalize()
             .expect("Failed to get absolute path to libpar2.a");
         Command::new("ar")
             .arg("x")
@@ -105,15 +108,17 @@ fn main() {
             .expect("Failed to extract libpar2.a");
 
         // Copy par2repairer_wrapper.o
-        std::fs::copy(
-            &wrapper_obj,
-            temp_dir.join("par2repairer_wrapper.o")
-        ).unwrap();
+        std::fs::copy(&wrapper_obj, temp_dir.join("par2repairer_wrapper.o")).unwrap();
 
         // Create combined library in build directory
-        let combined_lib_path = build_dir.join("libpar2_combined.a").canonicalize()
+        let combined_lib_path = build_dir
+            .join("libpar2_combined.a")
+            .canonicalize()
             .unwrap_or_else(|_| {
-                std::env::current_dir().unwrap().join(&build_dir).join("libpar2_combined.a")
+                std::env::current_dir()
+                    .unwrap()
+                    .join(&build_dir)
+                    .join("libpar2_combined.a")
             });
 
         let status = Command::new("sh")
@@ -134,9 +139,14 @@ fn main() {
     }
 
     // Tell cargo to link the combined library from build directory
-    let combined_lib = build_dir.join("libpar2_combined.a").canonicalize()
+    let combined_lib = build_dir
+        .join("libpar2_combined.a")
+        .canonicalize()
         .expect("Failed to find libpar2_combined.a in build directory");
-    println!("cargo:rustc-link-search=native={}", build_dir.canonicalize().unwrap().display());
+    println!(
+        "cargo:rustc-link-search=native={}",
+        build_dir.canonicalize().unwrap().display()
+    );
     println!("cargo:rustc-link-lib=static=par2_combined");
 
     // Also add the full path as a direct link argument

@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 /// A high-performance NZB downloader for Usenet
@@ -36,30 +36,10 @@ pub struct Cli {
     #[arg(short = 'c', long, value_name = "NUM")]
     pub connections: Option<u16>,
 
-    /// Bandwidth limit in KB/s (0 = unlimited)
-    #[arg(long = "limit-rate", value_name = "RATE")]
-    pub limit_rate: Option<u64>,
-
-    /// Connection timeout in seconds
-    #[arg(long = "timeout", value_name = "SECS", default_value = "30")]
-    pub timeout: u64,
-
-    /// Number of retries for failed segments
-    #[arg(long = "retries", value_name = "NUM", default_value = "3")]
-    pub retries: u8,
-
     // Download Options
     /// Output directory
     #[arg(short = 'o', long = "output-dir", value_name = "DIR")]
     pub output_dir: Option<PathBuf>,
-
-    /// Continue partial downloads
-    #[arg(short = 'C', long = "continue")]
-    pub continue_download: bool,
-
-    /// Overwrite existing files
-    #[arg(long = "overwrite")]
-    pub overwrite: bool,
 
     /// Don't create subdirectories
     #[arg(long = "no-directories")]
@@ -90,10 +70,6 @@ pub struct Cli {
     /// List NZB contents without downloading
     #[arg(short = 'l', long = "list")]
     pub list: bool,
-
-    /// Show download progress (auto, bar, percent, quiet)
-    #[arg(long = "progress", value_enum, default_value = "auto")]
-    pub progress: ProgressType,
 
     /// Quiet mode (no output except errors)
     #[arg(short = 'q', long = "quiet")]
@@ -149,14 +125,6 @@ pub struct Cli {
     #[arg(long = "log-file", value_name = "FILE")]
     pub log_file: Option<PathBuf>,
 
-    /// Dry run (simulate download without fetching)
-    #[arg(long = "dry-run")]
-    pub dry_run: bool,
-
-    /// Run self-tests
-    #[arg(long = "self-test", hide = true)]
-    pub self_test: bool,
-
     /// Subcommands for additional functionality
     #[command(subcommand)]
     pub command: Option<Commands>,
@@ -195,20 +163,6 @@ pub enum Commands {
         #[arg(long = "detailed")]
         detailed: bool,
     },
-}
-
-#[derive(Debug, Clone, ValueEnum)]
-pub enum ProgressType {
-    /// Automatically choose progress display
-    Auto,
-    /// Show progress bar
-    Bar,
-    /// Show percentage only
-    Percent,
-    /// No progress output
-    Quiet,
-    /// Detailed progress with stats
-    Verbose,
 }
 
 impl Cli {

@@ -12,16 +12,41 @@ use deadpool::managed::{Manager, Pool, RecycleResult};
 use std::sync::Arc;
 use tokio::time::Duration;
 
-/// Connection manager for deadpool
+/// Connection manager for deadpool with rate-limited creation
 pub struct NntpConnectionManager {
     config: Arc<UsenetConfig>,
+    tls_connector: Option<Arc<tokio_native_tls::TlsConnector>>,
+    creation_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl NntpConnectionManager {
-    pub fn new(config: UsenetConfig) -> Self {
-        Self {
+    pub fn new(config: UsenetConfig) -> Result<Self, DlNzbError> {
+        // Create shared TLS connector for session reuse
+        let tls_connector = if config.ssl {
+            let mut tls_builder = native_tls::TlsConnector::builder();
+            if !config.verify_ssl_certs {
+                tls_builder.danger_accept_invalid_certs(true);
+                tls_builder.danger_accept_invalid_hostnames(true);
+            }
+            let native_connector = tls_builder
+                .build()
+                .map_err(|e| NntpError::TlsError(e.to_string()))?;
+            Some(Arc::new(tokio_native_tls::TlsConnector::from(
+                native_connector,
+            )))
+        } else {
+            None
+        };
+
+        // Rate limit connection creation to avoid overwhelming server
+        // Allow up to 10 connections to be created concurrently
+        let creation_semaphore = Arc::new(tokio::sync::Semaphore::new(10));
+
+        Ok(Self {
             config: Arc::new(config),
-        }
+            tls_connector,
+            creation_semaphore,
+        })
     }
 }
 
@@ -30,7 +55,16 @@ impl Manager for NntpConnectionManager {
     type Error = DlNzbError;
 
     async fn create(&self) -> Result<AsyncNntpConnection, DlNzbError> {
-        AsyncNntpConnection::connect(&self.config)
+        // Rate limit connection creation - only allow 10 concurrent connection attempts
+        let _permit = self.creation_semaphore.acquire().await.map_err(|e| {
+            DlNzbError::from(NntpError::ConnectionFailed {
+                server: self.config.server.clone(),
+                port: self.config.port,
+                source: std::io::Error::new(std::io::ErrorKind::Other, e),
+            })
+        })?;
+
+        AsyncNntpConnection::connect(&self.config, self.tls_connector.clone())
             .await
             .map_err(|e| {
                 tracing::error!("Failed to create NNTP connection: {}", e);
@@ -107,7 +141,7 @@ impl NntpPoolBuilder {
     }
 
     pub fn build(self) -> Result<NntpPool, DlNzbError> {
-        let manager = NntpConnectionManager::new(self.config);
+        let manager = NntpConnectionManager::new(self.config)?;
         Pool::builder(manager)
             .max_size(self.max_size)
             .runtime(deadpool::Runtime::Tokio1)
@@ -129,9 +163,6 @@ impl NntpPoolBuilder {
 pub trait NntpPoolExt {
     /// Get a connection from the pool
     async fn get_connection(&self) -> Result<PooledConnection, DlNzbError>;
-
-    /// Pre-warm the pool by creating initial connections
-    async fn warm_up(&self, target: usize) -> Result<(), DlNzbError>;
 }
 
 #[async_trait]
@@ -146,21 +177,6 @@ impl NntpPoolExt for NntpPool {
             }
         })?;
         Ok(PooledConnection { conn })
-    }
-
-    async fn warm_up(&self, target: usize) -> Result<(), DlNzbError> {
-        let mut connections = Vec::new();
-        for _ in 0..target.min(self.status().max_size) {
-            match self.get().await {
-                Ok(conn) => connections.push(conn),
-                Err(e) => {
-                    tracing::warn!("Failed to pre-warm connection: {}", e);
-                    break;
-                }
-            }
-        }
-        // Connections are automatically returned to pool when dropped
-        Ok(())
     }
 }
 

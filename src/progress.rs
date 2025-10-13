@@ -11,6 +11,10 @@ use std::time::Duration;
 pub enum ProgressStyle {
     Download,
     Par2,
+    Par2Verify,
+    Par2Repair,
+    Par2Warning,
+    Par2Error,
     Extract,
 }
 
@@ -28,37 +32,77 @@ pub fn apply_style(bar: &ProgressBar, style: ProgressStyle) {
         ProgressStyle::Download => {
             bar.set_style(
                 IndicatifStyle::with_template(
-                    "[{bar:40.cyan/blue}] {percent:>3}% {bytes:>10}/{total_bytes:<10} {bytes_per_sec:>12} ETA {eta:>5} {msg}"
+                    "[{bar:40.cyan/blue}] \x1b[1m{percent:>3}%\x1b[0m \x1b[36m{bytes:>10}\x1b[0m\x1b[90m/\x1b[0m\x1b[90m{total_bytes:<10}\x1b[0m \x1b[90m│\x1b[0m {bytes_per_sec} \x1b[90m│\x1b[0m {eta} \x1b[36m{msg}\x1b[0m"
                 )
                 .unwrap()
                 .progress_chars("━━╸ ")
                 .with_key("eta", |state: &indicatif::ProgressState, w: &mut dyn std::fmt::Write| {
-                    let _ = write!(w, "{:>5.0}s", state.eta().as_secs_f64());
+                    let _ = write!(w, "\x1b[33mETA {:>4.0}s\x1b[0m", state.eta().as_secs_f64());
                 })
                 .with_key("bytes_per_sec", |state: &indicatif::ProgressState, w: &mut dyn std::fmt::Write| {
                     let bytes_per_sec = state.per_sec();
                     if bytes_per_sec > 1_048_576.0 {
-                        let _ = write!(w, "{:>7.2} MiB/s", bytes_per_sec / 1_048_576.0);
+                        let _ = write!(w, "\x1b[1;32m{:>6.2} MiB/s\x1b[0m", bytes_per_sec / 1_048_576.0);
                     } else if bytes_per_sec > 1024.0 {
-                        let _ = write!(w, "{:>7.2} KiB/s", bytes_per_sec / 1024.0);
+                        let _ = write!(w, "\x1b[1;32m{:>6.2} KiB/s\x1b[0m", bytes_per_sec / 1024.0);
                     } else {
-                        let _ = write!(w, "{:>7.0}  B/s", bytes_per_sec);
+                        let _ = write!(w, "\x1b[1;32m{:>6.0}  B/s\x1b[0m", bytes_per_sec);
                     }
                 })
             );
         }
         ProgressStyle::Par2 => {
             bar.set_style(
-                IndicatifStyle::with_template("[{bar:40.yellow}] {percent:>3}% {msg}")
-                    .unwrap()
-                    .progress_chars("━━╸ ")
+                IndicatifStyle::with_template(
+                    "[{bar:40.yellow}] \x1b[1m{percent:>3}%\x1b[0m \x1b[33m{msg}\x1b[0m",
+                )
+                .unwrap()
+                .progress_chars("━━╸ "),
+            );
+        }
+        ProgressStyle::Par2Verify => {
+            bar.set_style(
+                IndicatifStyle::with_template(
+                    "[{bar:40.cyan/blue}] \x1b[1m{percent:>3}%\x1b[0m \x1b[36m{msg}\x1b[0m",
+                )
+                .unwrap()
+                .progress_chars("━━╸ "),
+            );
+        }
+        ProgressStyle::Par2Repair => {
+            bar.set_style(
+                IndicatifStyle::with_template(
+                    "[{bar:40.magenta/red}] \x1b[1m{percent:>3}%\x1b[0m \x1b[35m{msg}\x1b[0m",
+                )
+                .unwrap()
+                .progress_chars("━━╸ "),
+            );
+        }
+        ProgressStyle::Par2Warning => {
+            bar.set_style(
+                IndicatifStyle::with_template(
+                    "[{bar:40.yellow}] \x1b[1m{percent:>3}%\x1b[0m \x1b[33m{msg}\x1b[0m",
+                )
+                .unwrap()
+                .progress_chars("━━╸ "),
+            );
+        }
+        ProgressStyle::Par2Error => {
+            bar.set_style(
+                IndicatifStyle::with_template(
+                    "[{bar:40.red}] \x1b[1m{percent:>3}%\x1b[0m \x1b[31m{msg}\x1b[0m",
+                )
+                .unwrap()
+                .progress_chars("━━╸ "),
             );
         }
         ProgressStyle::Extract => {
             bar.set_style(
-                IndicatifStyle::with_template("[{bar:40.green}] {percent:>3}% {msg}")
-                    .unwrap()
-                    .progress_chars("━━╸ ")
+                IndicatifStyle::with_template(
+                    "[{bar:40.green}] \x1b[1m{percent:>3}%\x1b[0m \x1b[32m{msg}\x1b[0m",
+                )
+                .unwrap()
+                .progress_chars("━━╸ "),
             );
         }
     }
@@ -73,14 +117,14 @@ pub fn format_download_summary(
 ) -> String {
     if failed_files == 0 {
         format!(
-            "({}/{}) ✓ Downloaded {}",
+            "({}/{})✓ Downloaded {}",
             files_count,
             total_files,
             human_bytes(bytes_downloaded as f64)
         )
     } else {
         format!(
-            "({}/{}) ⚠ Downloaded {} ({} with errors)",
+            "({}/{})! Downloaded {} ({} files with errors)",
             files_count,
             total_files,
             human_bytes(bytes_downloaded as f64),

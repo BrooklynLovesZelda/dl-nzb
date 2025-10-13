@@ -26,19 +26,19 @@
 //! ```
 
 // Core modules
-pub mod error;
-pub mod config;
-pub mod progress;
 pub mod cli;
+pub mod config;
+pub mod error;
+pub mod progress;
 
 // Feature modules organized by functionality
-pub mod nntp;
 pub mod download;
+pub mod nntp;
 pub mod processing;
 
 // Re-export commonly used types
-pub use error::{DlNzbError, Result};
 pub use config::Config;
+pub use download::{DownloadResult, Downloader, Nzb};
+pub use error::{DlNzbError, Result};
 pub use nntp::{NntpPool, NntpPoolBuilder, NntpPoolExt};
-pub use download::{Downloader, DownloadResult, Nzb};
 pub use processing::PostProcessor;

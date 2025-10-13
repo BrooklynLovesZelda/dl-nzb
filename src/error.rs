@@ -168,6 +168,13 @@ pub enum PostProcessingError {
 
     #[error("Extraction tool not found: {tool}")]
     ToolNotFound { tool: String },
+
+    #[error("Failed to rename file from {from} to {to}: {source}")]
+    FileRenameError {
+        from: PathBuf,
+        to: PathBuf,
+        source: std::io::Error,
+    },
 }
 
 /// Result type alias using DlNzbError

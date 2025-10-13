@@ -1,6 +1,27 @@
+# Build artifacts
 /target
 /.build
 *.a
 *.o
+
+# Temp directories
+.dl-nzb-temp/
+*.tmp
+*.log
+flamegraph.svg
+
+# macOS
 .DS_Store
+.AppleDouble
+.LSOverride
+
+# IDE
+.vscode/
+.idea/
+.claude/
+
+# Rust
 Cargo.lock
+
+# Config (user-specific)
+config.toml
