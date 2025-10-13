@@ -33,57 +33,50 @@ jobs:
           body: |
             ## Downloads
 
-            - **Linux x86_64**: `dl-nzb-linux-x86_64`
-            - **Linux ARM64**: `dl-nzb-linux-aarch64`
-            - **macOS x86_64**: `dl-nzb-macos-x86_64`
-            - **macOS ARM64 (Apple Silicon)**: `dl-nzb-macos-aarch64`
-            - **Windows x86_64**: `dl-nzb-windows-x86_64.exe`
+            ### Linux
+            - **x86_64**: `dl-nzb-linux-x86_64`
+            - **ARM64**: `dl-nzb-linux-aarch64`
+
+            ### macOS
+            - **x86_64 (Intel)**: `dl-nzb-macos-x86_64`
+            - **ARM64 (Apple Silicon)**: `dl-nzb-macos-aarch64`
+
+            ### Windows
+            - **x86_64**: `dl-nzb-windows-x86_64.exe`
 
             ## Installation
 
-            Download the appropriate binary for your platform, make it executable (Unix), and run it.
+            Download the appropriate binary for your platform:
+
+            ```bash
+            # macOS/Linux - make executable
+            chmod +x dl-nzb-*
+            ./dl-nzb-* --version
+
+            # Move to PATH (optional)
+            sudo mv dl-nzb-* /usr/local/bin/dl-nzb
+            ```
 
             ## Changelog
 
             See [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/main/CHANGELOG.md) for details.
 
-  build:
-    name: Build ${{ matrix.target }}
+  build-linux:
+    name: Build Linux ${{ matrix.arch }}
     needs: create-release
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Linux x86_64
-          - os: ubuntu-latest
+          - arch: x86_64
             target: x86_64-unknown-linux-gnu
             name: dl-nzb-linux-x86_64
-            build_deps: sudo apt-get update && sudo apt-get install -y autoconf automake libtool g++
 
-          # Linux ARM64
-          - os: ubuntu-latest
+          - arch: aarch64
             target: aarch64-unknown-linux-gnu
             name: dl-nzb-linux-aarch64
-            build_deps: sudo apt-get update && sudo apt-get install -y autoconf automake libtool gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
-
-          # macOS x86_64
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            name: dl-nzb-macos-x86_64
-            build_deps: brew install autoconf automake libtool
-
-          # macOS ARM64 (Apple Silicon)
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            name: dl-nzb-macos-aarch64
-            build_deps: brew install autoconf automake libtool
-
-          # Windows x86_64 (using MSYS2)
-          - os: windows-latest
-            target: x86_64-pc-windows-gnu
-            name: dl-nzb-windows-x86_64.exe
-            build_deps: |
+            cross_compile: true
 
     steps:
       - name: Checkout code
@@ -96,79 +89,40 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install build dependencies (Linux)
-        if: runner.os == 'Linux'
-        run: ${{ matrix.build_deps }}
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y autoconf automake libtool g++
 
-      - name: Install build dependencies (macOS)
-        if: runner.os == 'macOS'
-        run: ${{ matrix.build_deps }}
+      - name: Install cross-compilation tools (ARM64)
+        if: matrix.cross_compile
+        run: |
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
 
-      - name: Setup MSYS2 (Windows)
-        if: runner.os == 'Windows'
-        uses: msys2/setup-msys2@v2
-        with:
-          msystem: MINGW64
-          update: true
-          install: >-
-            base-devel
-            mingw-w64-x86_64-toolchain
-            mingw-w64-x86_64-autotools
-            autoconf
-            automake
-            libtool
-
-      - name: Set up cross-compilation environment (Linux ARM64)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
+      - name: Set up cross-compilation environment (ARM64)
+        if: matrix.cross_compile
         run: |
           echo "CC=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
           echo "CXX=aarch64-linux-gnu-g++" >> $GITHUB_ENV
           echo "AR=aarch64-linux-gnu-ar" >> $GITHUB_ENV
           echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
 
-      - name: Cache cargo registry
-        uses: actions/cache@v3
-        with:
-          path: ~/.cargo/registry
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Cache cargo index
-        uses: actions/cache@v3
-        with:
-          path: ~/.cargo/git
-          key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Cache target directory
-        uses: actions/cache@v3
-        with:
-          path: target
-          key: ${{ runner.os }}-${{ matrix.target }}-target-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Build (Unix)
-        if: runner.os != 'Windows'
+      - name: Build
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Build (Windows with MSYS2)
-        if: runner.os == 'Windows'
-        shell: msys2 {0}
+      - name: Strip binary
         run: |
-          export PATH="/mingw64/bin:$PATH"
-          cargo build --release --target ${{ matrix.target }}
+          if [ "${{ matrix.cross_compile }}" = "true" ]; then
+            aarch64-linux-gnu-strip target/${{ matrix.target }}/release/dl-nzb || true
+          else
+            strip target/${{ matrix.target }}/release/dl-nzb || true
+          fi
 
-      - name: Strip binary (Linux/macOS)
-        if: runner.os != 'Windows'
-        run: strip target/${{ matrix.target }}/release/dl-nzb
-
-      - name: Prepare binary (Unix)
-        if: runner.os != 'Windows'
+      - name: Prepare binary
         run: |
           cp target/${{ matrix.target }}/release/dl-nzb ${{ matrix.name }}
           chmod +x ${{ matrix.name }}
-
-      - name: Prepare binary (Windows)
-        if: runner.os == 'Windows'
-        run: |
-          copy target\${{ matrix.target }}\release\dl-nzb.exe ${{ matrix.name }}
+          ls -lh ${{ matrix.name }}
 
       - name: Upload Release Asset
         uses: actions/upload-release-asset@v1
@@ -181,14 +135,7 @@ jobs:
           asset_content_type: application/octet-stream
 
       - name: Calculate SHA256
-        id: sha256
-        run: |
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            sha256sum ${{ matrix.name }} > ${{ matrix.name }}.sha256
-          else
-            shasum -a 256 ${{ matrix.name }} > ${{ matrix.name }}.sha256
-          fi
-        shell: bash
+        run: shasum -a 256 ${{ matrix.name }} > ${{ matrix.name }}.sha256
 
       - name: Upload SHA256 checksum
         uses: actions/upload-release-asset@v1
@@ -198,4 +145,142 @@ jobs:
           upload_url: ${{ needs.create-release.outputs.upload_url }}
           asset_path: ./${{ matrix.name }}.sha256
           asset_name: ${{ matrix.name }}.sha256
+          asset_content_type: text/plain
+
+  build-macos:
+    name: Build macOS ${{ matrix.arch }}
+    needs: create-release
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Use macos-13 (Intel) for x86_64 builds
+          - arch: x86_64
+            os: macos-13
+            target: x86_64-apple-darwin
+            name: dl-nzb-macos-x86_64
+
+          # Use macos-latest (M1) for ARM64 builds
+          - arch: aarch64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            name: dl-nzb-macos-aarch64
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          submodules: recursive
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install build dependencies
+        run: brew install autoconf automake libtool
+
+      - name: Clean build directory
+        run: |
+          rm -rf .build
+          rm -rf target
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Strip binary
+        run: strip target/${{ matrix.target }}/release/dl-nzb || true
+
+      - name: Prepare binary
+        run: |
+          cp target/${{ matrix.target }}/release/dl-nzb ${{ matrix.name }}
+          chmod +x ${{ matrix.name }}
+          ls -lh ${{ matrix.name }}
+          file ${{ matrix.name }}
+
+      - name: Upload Release Asset
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ needs.create-release.outputs.upload_url }}
+          asset_path: ./${{ matrix.name }}
+          asset_name: ${{ matrix.name }}
+          asset_content_type: application/octet-stream
+
+      - name: Calculate SHA256
+        run: shasum -a 256 ${{ matrix.name }} > ${{ matrix.name }}.sha256
+
+      - name: Upload SHA256 checksum
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ needs.create-release.outputs.upload_url }}
+          asset_path: ./${{ matrix.name }}.sha256
+          asset_name: ${{ matrix.name }}.sha256
+          asset_content_type: text/plain
+
+  build-windows:
+    name: Build Windows x86_64
+    needs: create-release
+    runs-on: windows-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          submodules: recursive
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            base-devel
+            mingw-w64-x86_64-toolchain
+            mingw-w64-x86_64-autotools
+            autoconf
+            automake
+            libtool
+
+      - name: Build
+        shell: msys2 {0}
+        run: |
+          export PATH="/mingw64/bin:$PATH"
+          cargo build --release --target x86_64-pc-windows-gnu
+
+      - name: Prepare binary
+        run: |
+          copy target\x86_64-pc-windows-gnu\release\dl-nzb.exe dl-nzb-windows-x86_64.exe
+          dir dl-nzb-windows-x86_64.exe
+
+      - name: Upload Release Asset
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ needs.create-release.outputs.upload_url }}
+          asset_path: ./dl-nzb-windows-x86_64.exe
+          asset_name: dl-nzb-windows-x86_64.exe
+          asset_content_type: application/octet-stream
+
+      - name: Calculate SHA256
+        shell: bash
+        run: sha256sum dl-nzb-windows-x86_64.exe > dl-nzb-windows-x86_64.exe.sha256
+
+      - name: Upload SHA256 checksum
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ needs.create-release.outputs.upload_url }}
+          asset_path: ./dl-nzb-windows-x86_64.exe.sha256
+          asset_name: dl-nzb-windows-x86_64.exe.sha256
           asset_content_type: text/plain
