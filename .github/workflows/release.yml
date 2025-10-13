@@ -125,6 +125,11 @@ jobs:
         run: |
           sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
 
+          # Install ARM64 OpenSSL development libraries
+          sudo dpkg --add-architecture arm64
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev:arm64
+
       - name: Set up cross-compilation environment (ARM64)
         if: matrix.cross_compile
         run: |
@@ -132,6 +137,11 @@ jobs:
           echo "CXX=aarch64-linux-gnu-g++" >> $GITHUB_ENV
           echo "AR=aarch64-linux-gnu-ar" >> $GITHUB_ENV
           echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+
+          # Point OpenSSL to ARM64 libraries
+          echo "OPENSSL_LIB_DIR=/usr/lib/aarch64-linux-gnu" >> $GITHUB_ENV
+          echo "OPENSSL_INCLUDE_DIR=/usr/include" >> $GITHUB_ENV
+          echo "PKG_CONFIG_ALLOW_CROSS=1" >> $GITHUB_ENV
 
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
@@ -279,7 +289,8 @@ jobs:
       - name: Build
         shell: msys2 {0}
         run: |
-          export PATH="/mingw64/bin:$PATH"
+          # Add Windows paths to find cargo
+          export PATH="/c/Users/runneradmin/.cargo/bin:/mingw64/bin:$PATH"
           cargo build --release --target x86_64-pc-windows-gnu
 
       - name: Prepare binary
