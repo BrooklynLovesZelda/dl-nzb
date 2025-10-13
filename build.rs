@@ -35,9 +35,17 @@ fn main() {
             }
         }
 
-        // Run configure
-        let status = Command::new("sh")
-            .arg("configure")
+        // Run configure with cross-compilation support
+        let target = env::var("TARGET").unwrap_or_else(|_| "unknown".to_string());
+        let mut configure_cmd = Command::new("sh");
+        configure_cmd.arg("configure");
+
+        // Add --host for cross-compilation
+        if target.contains("aarch64") && !target.contains("darwin") {
+            configure_cmd.arg("--host=aarch64-linux-gnu");
+        }
+
+        let status = configure_cmd
             .current_dir(&par2_root)
             .status()
             .expect("Failed to run configure - make sure autotools are installed");
@@ -65,8 +73,11 @@ fn main() {
             .canonicalize()
             .expect("Failed to find src/processing/par2repairer.cpp");
 
+        // Use cross-compiler if needed
+        let cxx = env::var("CXX").unwrap_or_else(|_| "g++".to_string());
+
         let wrapper_obj = build_dir.join("par2repairer_wrapper.o");
-        let status = Command::new("g++")
+        let status = Command::new(&cxx)
             .args([
                 "-std=c++14",
                 "-DHAVE_CONFIG_H",
@@ -96,11 +107,12 @@ fn main() {
         std::fs::create_dir_all(&temp_dir).unwrap();
 
         // Extract libpar2.a
+        let ar = env::var("AR").unwrap_or_else(|_| "ar".to_string());
         let libpar2_path = par2_root
             .join("libpar2.a")
             .canonicalize()
             .expect("Failed to get absolute path to libpar2.a");
-        Command::new("ar")
+        Command::new(&ar)
             .arg("x")
             .arg(&libpar2_path)
             .current_dir(&temp_dir)
@@ -123,7 +135,7 @@ fn main() {
 
         let status = Command::new("sh")
             .arg("-c")
-            .arg(format!("ar rcs {} *.o", combined_lib_path.display()))
+            .arg(format!("{} rcs {} *.o", ar, combined_lib_path.display()))
             .current_dir(&temp_dir)
             .status()
             .expect("Failed to create combined library");
