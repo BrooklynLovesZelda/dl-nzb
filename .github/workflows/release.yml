@@ -291,15 +291,6 @@ jobs:
       - name: Build
         shell: msys2 {0}
         run: |
-          # Debug: Check if progtest.m4 exists and where
-          echo "Searching for progtest.m4..."
-          find /usr -name "progtest.m4" 2>/dev/null || echo "Not found in /usr"
-          find /mingw64 -name "progtest.m4" 2>/dev/null || echo "Not found in /mingw64"
-
-          # List aclocal directory contents
-          echo "Contents of /usr/share/aclocal:"
-          ls -la /usr/share/aclocal/ | head -20 || echo "Directory not accessible"
-
           # Add Windows paths to find cargo
           export PATH="/c/Users/runneradmin/.cargo/bin:/mingw64/bin:$PATH"
           cargo build --release --target x86_64-pc-windows-gnu

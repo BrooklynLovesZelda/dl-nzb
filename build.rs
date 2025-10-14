@@ -24,9 +24,15 @@ fn main() {
         // Run automake.sh if configure doesn't exist
         let configure_path = par2_root.join("configure");
         if !configure_path.exists() {
-            let status = Command::new("sh")
-                .arg("automake.sh")
-                .current_dir(&par2_root)
+            let mut cmd = Command::new("sh");
+            cmd.arg("automake.sh").current_dir(&par2_root);
+
+            // On Windows/MSYS2, set ACLOCAL_PATH to find m4 macros
+            if cfg!(target_os = "windows") {
+                cmd.env("ACLOCAL_PATH", "/usr/share/aclocal:/mingw64/share/aclocal");
+            }
+
+            let status = cmd
                 .status()
                 .expect("Failed to run automake.sh - make sure autotools are installed");
 

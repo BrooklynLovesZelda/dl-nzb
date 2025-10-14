@@ -39,6 +39,20 @@ impl PostProcessor {
 
         let download_dir = results[0].path.parent().unwrap_or(Path::new("."));
 
+        // Track which PAR2 files were actually downloaded
+        // (so we only delete PAR2 files that were part of this NZB download)
+        let downloaded_par2_files: Vec<PathBuf> = results
+            .iter()
+            .filter(|r| {
+                r.path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .map(|ext| ext.to_lowercase() == "par2")
+                    .unwrap_or(false)
+            })
+            .map(|r| r.path.clone())
+            .collect();
+
         // Get the useful name from the first result's parent directory or NZB name
         let useful_name = download_dir
             .file_name()
@@ -51,8 +65,9 @@ impl PostProcessor {
             let bar = ProgressBar::new(100);
             bar.enable_steady_tick(Duration::from_millis(100));
 
-            
-            self.repair_with_par2(download_dir, &bar).await?
+
+            self.repair_with_par2(download_dir, &downloaded_par2_files, &bar)
+                .await?
         } else {
             Par2Status::NoPar2Files
         };
@@ -117,9 +132,16 @@ impl PostProcessor {
     async fn repair_with_par2(
         &self,
         download_dir: &Path,
+        downloaded_par2_files: &[PathBuf],
         progress_bar: &ProgressBar,
     ) -> Result<Par2Status> {
         progress_bar.set_message("Searching for PAR2 files...");
+
+        if downloaded_par2_files.is_empty() {
+            // No PAR2 files were downloaded - silently finish and clear this progress bar
+            progress_bar.finish_and_clear();
+            return Ok(Par2Status::NoPar2Files);
+        }
 
         // Get list of files before PAR2 repair (to detect renames)
         let files_before: std::collections::HashSet<String> = std::fs::read_dir(download_dir)?
@@ -127,23 +149,8 @@ impl PostProcessor {
             .map(|entry| entry.file_name().to_string_lossy().to_string())
             .collect();
 
-        // Find PAR2 files in download directory
-        let mut par2_files: Vec<PathBuf> = std::fs::read_dir(download_dir)?
-            .filter_map(|entry| entry.ok())
-            .map(|entry| entry.path())
-            .filter(|path| {
-                path.extension()
-                    .and_then(|ext| ext.to_str())
-                    .map(|ext| ext.to_lowercase() == "par2")
-                    .unwrap_or(false)
-            })
-            .collect();
-
-        if par2_files.is_empty() {
-            // No PAR2 files - silently finish and clear this progress bar
-            progress_bar.finish_and_clear();
-            return Ok(Par2Status::NoPar2Files);
-        }
+        // Use the PAR2 files that were actually downloaded (not random ones in the directory)
+        let mut par2_files = downloaded_par2_files.to_vec();
 
         // Count total files to scan for progress tracking
         let total_files = files_before.len() as u64;
@@ -200,10 +207,12 @@ impl PostProcessor {
         });
 
         // Run PAR2 repair with real progress tracking
-        // purge_files will delete PAR2 files after successful repair if configured
+        // Note: par2cmdline-turbo's purge_files flag only works when repair is actually performed.
+        // When files are already OK (verification succeeds), it returns early without purging.
+        // We handle cleanup manually after successful verification/repair.
         match repairer.repair_with_progress(
             true,
-            self.config.delete_par2_after_repair,
+            false, // Don't rely on par2cmdline-turbo's purge - handle it ourselves
             Some(progress_callback),
         ) {
             Ok(()) => {
@@ -218,6 +227,32 @@ impl PostProcessor {
 
                 let renamed_count = files_before.symmetric_difference(&files_after).count() / 2;
 
+                // Delete PAR2 files after successful verification/repair if configured
+                // par2cmdline-turbo's purgefiles only works when actual repair happens,
+                // not when files are already OK (eRepairPossible return path).
+                // We handle it here to ensure PAR2 files are always deleted on success.
+                // IMPORTANT: Only delete PAR2 files that were part of this NZB download,
+                // not random PAR2 files that might be in the directory.
+                if self.config.delete_par2_after_repair {
+                    let mut deleted_count = 0;
+                    for par2_path in downloaded_par2_files {
+                        if par2_path.exists() {
+                            match std::fs::remove_file(par2_path) {
+                                Ok(_) => {
+                                    deleted_count += 1;
+                                    tracing::debug!("Deleted PAR2 file: {}", par2_path.display());
+                                }
+                                Err(e) => {
+                                    tracing::warn!("Failed to delete {}: {}", par2_path.display(), e);
+                                }
+                            }
+                        }
+                    }
+                    if deleted_count > 0 {
+                        tracing::debug!("Cleaned up {} PAR2 file(s)", deleted_count);
+                    }
+                }
+
                 progress_bar.finish_with_message("  ");
                 if renamed_count > 0 {
                     println!(
@@ -228,7 +263,6 @@ impl PostProcessor {
                     println!("  └─ \x1b[33m✓ PAR2 verified\x1b[0m");
                 }
 
-                // Note: PAR2 files are automatically deleted by par2cmdline-turbo if purge_files=true
                 Ok(Par2Status::Success)
             }
             Err(e) => {
@@ -409,34 +443,44 @@ impl PostProcessor {
         &self,
         archive_path: &Path,
         output_dir: &Path,
-        _progress_bar: &ProgressBar,
+        progress_bar: &ProgressBar,
     ) -> Result<bool> {
-        // Validate RAR archive by trying to list it
-        match Archive::new(archive_path).open_for_listing() {
+        // First pass: Count total files
+        let file_count = match Archive::new(archive_path).open_for_listing() {
             Ok(mut listing) => {
-                // Check if archive has any valid entries
-                if let Some(entry_result) = listing.next() {
+                let mut count = 0u64;
+
+                while let Some(entry_result) = listing.next() {
                     match entry_result {
-                        Ok(_) => {
-                            // Has at least one valid entry, continue
+                        Ok(entry) => {
+                            if !entry.is_directory() {
+                                count += 1;
+                            }
                         }
                         Err(_) => return Ok(false),
                     }
-                } else {
-                    // Empty archive
-                    return Ok(false);
                 }
+
+                if count == 0 {
+                    return Ok(false); // Empty archive
+                }
+
+                count
             }
             Err(_) => return Ok(false),
-        }
+        };
+
+        // Setup progress tracking (per-file)
+        progress_bar.set_length(file_count);
+        progress_bar.set_position(0);
 
         // Ensure output directory exists
         std::fs::create_dir_all(output_dir)?;
 
-        // Extract the archive
+        // Extract the archive with per-file progress
         match Archive::new(archive_path).open_for_processing() {
             Ok(mut archive) => {
-                let mut extracted_files = 0;
+                let mut extracted_files = 0u64;
 
                 loop {
                     match archive.read_header() {
@@ -455,6 +499,21 @@ impl PostProcessor {
                                 }
                             }
 
+                            // Update progress message with current file being extracted
+                            let file_display = filename.to_string_lossy();
+                            let short_name = if file_display.len() > 40 {
+                                format!("...{}", &file_display[file_display.len() - 37..])
+                            } else {
+                                file_display.to_string()
+                            };
+
+                            progress_bar.set_message(format!(
+                                "Extracting {} [{}/{}]",
+                                short_name,
+                                extracted_files + 1,
+                                file_count
+                            ));
+
                             // Ensure parent directory exists for nested files
                             let output_path = output_dir.join(&filename);
                             if let Some(parent) = output_path.parent() {
@@ -466,6 +525,7 @@ impl PostProcessor {
                                 Ok(next_archive) => {
                                     archive = next_archive;
                                     extracted_files += 1;
+                                    progress_bar.set_position(extracted_files);
                                 }
                                 Err(e) => {
                                     tracing::warn!(
@@ -484,6 +544,9 @@ impl PostProcessor {
                         }
                     }
                 }
+
+                // Final progress update
+                progress_bar.set_position(file_count);
 
                 Ok(extracted_files > 0)
             }
