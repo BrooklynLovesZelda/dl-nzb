@@ -51,7 +51,7 @@ pub struct Cli {
     #[arg(long, value_name = "FILE")]
     pub config: Option<PathBuf>,
 
-    /// Force operation (skip confirmations)
+    /// Force re-download (overwrite existing files)
     #[arg(short, long)]
     pub force: bool,
 

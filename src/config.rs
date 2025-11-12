@@ -79,6 +79,8 @@ pub struct DownloadConfig {
     pub dir: PathBuf,
     pub create_subfolders: bool,
     pub user_agent: String,
+    #[serde(default)]
+    pub force_redownload: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -128,6 +130,7 @@ impl Default for DownloadConfig {
             dir: PathBuf::from("downloads"),
             create_subfolders: true,
             user_agent: format!("dl-nzb/{}", env!("CARGO_PKG_VERSION")),
+            force_redownload: false,
         }
     }
 }

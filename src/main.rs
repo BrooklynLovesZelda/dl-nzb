@@ -363,6 +363,7 @@ async fn handle_download_mode(cli: &Cli, mut config: Config) -> Result<()> {
         // Update config for this download
         let mut download_config = config.clone();
         download_config.download.dir = output_dir.clone();
+        download_config.download.force_redownload = cli.force;
 
         // Download the NZB with updated config
         match downloader
