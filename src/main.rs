@@ -1,4 +1,5 @@
 use human_bytes::human_bytes;
+use std::error::Error;
 use tracing_subscriber::EnvFilter;
 
 use dl_nzb::{
@@ -6,15 +7,41 @@ use dl_nzb::{
     config::Config,
     download::{Downloader, Nzb},
     error::{ConfigError, DlNzbError},
+    json_output::{NzbInfo, FileInfo, TestResult, ErrorOutput},
     nntp::AsyncNntpConnection,
     processing::PostProcessor,
+    serde_json,
 };
 
 type Result<T> = std::result::Result<T, DlNzbError>;
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
     let cli = Cli::parse_and_validate();
+
+    // Store JSON flag before moving cli
+    let use_json = cli.json;
+
+    // Run the actual main logic and handle errors appropriately
+    if let Err(e) = run(cli).await {
+        if use_json {
+            let error_output = ErrorOutput::from_error(&e);
+            eprintln!("{}", serde_json::to_string_pretty(&error_output).unwrap_or_else(|_| {
+                format!(r#"{{"error": "Failed to serialize error"}}"#)
+            }));
+        } else {
+            eprintln!("Error: {}", e);
+            let mut source = e.source();
+            while let Some(err) = source {
+                eprintln!("  Caused by: {}", err);
+                source = err.source();
+            }
+        }
+        std::process::exit(1);
+    }
+}
+
+async fn run(cli: Cli) -> Result<()> {
 
     // Initialize logging
     init_logging(&cli)?;
@@ -30,7 +57,15 @@ async fn main() -> Result<()> {
     // Apply CLI overrides
     config.apply_overrides(cli.get_config_overrides());
 
-    // Handle username/password from CLI
+    // Handle deprecated flags for backwards compatibility
+    if cli.has_deprecated_flags() {
+        eprintln!("Note: Some flags used are deprecated. See --help for current usage.");
+    }
+
+    // Note: no_resume flag handling removed as resume field was removed from config
+    // This could be re-added if needed
+
+    // Handle username/password from CLI (backwards compat)
     if let Some(username) = &cli.username {
         config.usenet.username = username.clone();
     }
@@ -80,38 +115,60 @@ fn init_logging(cli: &Cli) -> Result<()> {
 }
 
 /// Handle subcommands
-async fn handle_command(command: &Commands, _cli: &Cli) -> Result<()> {
+async fn handle_command(command: &Commands, cli: &Cli) -> Result<()> {
     match command {
-        Commands::Test { server } => {
-            println!("Testing connection to Usenet server...");
-
+        Commands::Test => {
             let config = Config::load()?;
-            let test_config = if let Some(server) = server {
-                let mut cfg = config.usenet.clone();
-                cfg.server = server.clone();
-                cfg
-            } else {
-                config.usenet.clone()
-            };
+            let test_config = config.usenet.clone();
 
-            // Test connection using async NNTP (no shared connector for test)
-            match AsyncNntpConnection::connect(&test_config, None).await {
-                Ok(mut conn) => {
-                    println!("✓ Successfully connected to {}", test_config.server);
-                    println!("   Authentication: OK");
+            if cli.json {
+                // JSON output mode
+                let mut result = TestResult {
+                    server: test_config.server.clone(),
+                    port: test_config.port,
+                    ssl: test_config.ssl,
+                    connected: false,
+                    authenticated: false,
+                    healthy: false,
+                    error: None,
+                };
 
-                    if conn.is_healthy().await {
-                        println!("   Server status: Healthy");
+                match AsyncNntpConnection::connect(&test_config, None).await {
+                    Ok(mut conn) => {
+                        result.connected = true;
+                        result.authenticated = true;
+                        result.healthy = conn.is_healthy().await;
+                        let _ = conn.close().await;
                     }
-
-                    let _ = conn.close().await;
-                    Ok(())
+                    Err(e) => {
+                        result.error = Some(e.to_string());
+                    }
                 }
-                Err(e) => {
-                    eprintln!("❌ Connection failed: {}", e);
-                    Err(e)
+
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                // Human-readable output
+                println!("Testing connection to Usenet server...");
+
+                match AsyncNntpConnection::connect(&test_config, None).await {
+                    Ok(mut conn) => {
+                        println!("✓ Successfully connected to {}", test_config.server);
+                        println!("   Authentication: OK");
+
+                        if conn.is_healthy().await {
+                            println!("   Server status: Healthy");
+                        }
+
+                        let _ = conn.close().await;
+                    }
+                    Err(e) => {
+                        eprintln!("❌ Connection failed: {}", e);
+                        return Err(e);
+                    }
                 }
             }
+
+            Ok(())
         }
 
         Commands::Config => {
@@ -138,28 +195,16 @@ async fn handle_command(command: &Commands, _cli: &Cli) -> Result<()> {
             Ok(())
         }
 
-        Commands::History {
-            show: _,
-            clear: _,
-            remove: _,
-        } => {
-            eprintln!("❌ History feature is not yet implemented.");
-            eprintln!();
-            eprintln!("This is a planned feature for tracking download history.");
-            eprintln!("Check https://github.com/zephleggett/dl-nzb/issues for updates.");
-            eprintln!();
-            eprintln!("For now, downloaded files are tracked in the filesystem.");
-            std::process::exit(1);
-        }
-
-        Commands::Version { detailed } => {
+        Commands::Version => {
             println!("dl-nzb {}", env!("CARGO_PKG_VERSION"));
-
-            if *detailed {
-                println!("Build information:");
-                println!("  Package version: {}", env!("CARGO_PKG_VERSION"));
-                println!("  Features: async, connection-pooling, streaming");
-            }
+            println!("A fast, lightweight NZB downloader");
+            println!();
+            println!("Features:");
+            println!("  • Parallel segment downloads");
+            println!("  • Built-in PAR2 repair");
+            println!("  • Automatic RAR extraction");
+            println!("  • Resume support");
+            println!("  • JSON output for scripting");
             Ok(())
         }
     }
@@ -167,33 +212,67 @@ async fn handle_command(command: &Commands, _cli: &Cli) -> Result<()> {
 
 /// Handle list mode
 async fn handle_list_mode(cli: &Cli) -> Result<()> {
-    for nzb_path in &cli.files {
-        println!("\n📄 {}", nzb_path.display());
-        println!("{}", "─".repeat(50));
+    if cli.json {
+        // JSON output mode
+        let mut results = Vec::new();
 
-        let nzb = Nzb::from_file(nzb_path)?;
+        for nzb_path in &cli.files {
+            let nzb = Nzb::from_file(nzb_path)?;
 
-        // Display NZB info
-        println!("Total files: {}", nzb.files().len());
-        println!("Total size: {}", human_bytes(nzb.total_size() as f64));
-        println!("Total segments: {}", nzb.total_segments());
+            let files: Vec<FileInfo> = nzb.files().iter().map(|file| {
+                let filename = Nzb::get_filename_from_subject(&file.subject)
+                    .unwrap_or_else(|| file.subject.clone());
+                let size: u64 = file.segments.segment.iter().map(|s| s.bytes).sum();
+                let is_par2 = filename.to_lowercase().ends_with(".par2");
 
-        println!("\nFiles:");
-        for file in nzb.files() {
-            let filename = Nzb::get_filename_from_subject(&file.subject)
-                .unwrap_or_else(|| file.subject.clone());
-            let size: u64 = file.segments.segment.iter().map(|s| s.bytes).sum();
-            let file_type = if filename.to_lowercase().ends_with(".par2") {
-                "PAR2"
-            } else {
-                "DATA"
-            };
-            println!(
-                "  [{:4}] {} ({})",
-                file_type,
-                filename,
-                human_bytes(size as f64)
-            );
+                FileInfo {
+                    filename,
+                    size,
+                    segments: file.segments.segment.len(),
+                    is_par2,
+                }
+            }).collect();
+
+            results.push(NzbInfo {
+                file: nzb_path.clone(),
+                total_files: nzb.files().len(),
+                total_size: nzb.total_size(),
+                total_segments: nzb.total_segments(),
+                files,
+            });
+        }
+
+        println!("{}", serde_json::to_string_pretty(&results)?);
+    } else {
+        // Human-readable output
+        for nzb_path in &cli.files {
+            println!("\n📄 {}", nzb_path.display());
+            println!("{}", "─".repeat(50));
+
+            let nzb = Nzb::from_file(nzb_path)?;
+
+            // Display NZB info
+            println!("Total files: {}", nzb.files().len());
+            println!("Total size: {}", human_bytes(nzb.total_size() as f64));
+            println!("Total segments: {}", nzb.total_segments());
+
+            println!("\nFiles:");
+            for file in nzb.files() {
+                let filename = Nzb::get_filename_from_subject(&file.subject)
+                    .unwrap_or_else(|| file.subject.clone());
+                let size: u64 = file.segments.segment.iter().map(|s| s.bytes).sum();
+                let file_type = if filename.to_lowercase().ends_with(".par2") {
+                    "PAR2"
+                } else {
+                    "DATA"
+                };
+                println!(
+                    "  [{:4}] {} ({})",
+                    file_type,
+                    filename,
+                    human_bytes(size as f64)
+                );
+            }
         }
     }
 
@@ -223,27 +302,36 @@ async fn handle_download_mode(cli: &Cli, mut config: Config) -> Result<()> {
         config.post_processing.delete_par2_after_repair = true;
     }
 
-    // Update memory settings
+    // Update memory settings (from deprecated flags if present)
     if let Some(memory_mb) = cli.memory_limit {
         config.memory.max_segments_in_memory = (memory_mb * 1024 * 1024) / 100_000; // Rough estimate
     }
-    config.memory.io_buffer_size = cli.buffer_size * 1024;
-    config.memory.max_concurrent_files = cli.max_concurrent_files;
+    if let Some(buffer_kb) = cli.buffer_size {
+        config.memory.io_buffer_size = buffer_kb * 1024;
+    }
+    if let Some(concurrent) = cli.max_concurrent_files {
+        config.memory.max_concurrent_files = concurrent;
+    }
 
-    // Create downloader with spinner
-    use indicatif::{ProgressBar, ProgressStyle};
-    let spinner = ProgressBar::new_spinner();
-    spinner.set_style(
-        ProgressStyle::with_template("{spinner:.cyan} {msg}")
-            .unwrap()
-            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
-    );
-    spinner.enable_steady_tick(std::time::Duration::from_millis(80));
-    spinner.set_message("Connecting to server...");
+    // Create downloader with spinner (unless JSON output)
+    let downloader = if cli.json {
+        Downloader::new(config.clone()).await?
+    } else {
+        use indicatif::{ProgressBar, ProgressStyle};
+        let spinner = ProgressBar::new_spinner();
+        spinner.set_style(
+            ProgressStyle::with_template("{spinner:.cyan} {msg}")
+                .unwrap()
+                .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
+        );
+        spinner.enable_steady_tick(std::time::Duration::from_millis(80));
+        spinner.set_message("Connecting to server...");
 
-    let downloader = Downloader::new(config.clone()).await?;
+        let downloader = Downloader::new(config.clone()).await?;
 
-    spinner.finish_and_clear();
+        spinner.finish_and_clear();
+        downloader
+    };
 
     // Process each NZB file
     let mut all_results = Vec::new();

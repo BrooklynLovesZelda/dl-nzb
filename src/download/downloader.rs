@@ -2,16 +2,14 @@ use bytes::Bytes;
 use futures::stream::{self, StreamExt};
 use indicatif::ProgressBar;
 use std::path::PathBuf;
-use std::sync::Arc; // Only for Semaphore
 use std::time::{Duration, Instant};
 use tokio::fs::File;
 use tokio::io::{AsyncWriteExt, BufWriter};
-use tokio::sync::Semaphore;
 
 use super::nzb::{Nzb, NzbFile};
 use crate::config::Config;
 use crate::error::{DlNzbError, DownloadError};
-use crate::nntp::{NntpPool, NntpPoolBuilder, NntpPoolExt};
+use crate::nntp::{NntpPool, NntpPoolBuilder, NntpPoolExt, SegmentRequest};
 use crate::progress;
 
 type Result<T> = std::result::Result<T, DlNzbError>;
@@ -39,7 +37,6 @@ struct SegmentResult {
 /// Optimized downloader using connection pooling and streaming
 pub struct Downloader {
     pool: NntpPool,
-    segment_semaphore: Arc<Semaphore>,
 }
 
 impl Downloader {
@@ -49,14 +46,7 @@ impl Downloader {
             .max_size(config.usenet.connections as usize)
             .build()?;
 
-        // Create semaphore to enforce max_segments_in_memory limit
-        // This prevents memory exhaustion on large downloads
-        let segment_semaphore = Arc::new(Semaphore::new(config.memory.max_segments_in_memory));
-
-        Ok(Self {
-            pool,
-            segment_semaphore,
-        })
+        Ok(Self { pool })
     }
 
     /// Download all files from an NZB, returns results and progress bar for reuse
@@ -141,9 +131,12 @@ impl Downloader {
         let total_files = files.len();
         let completed_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
-        let download_futures = files.iter().map(|file| {
+        // Sort files by size (largest first) to maximize initial throughput
+        let mut sorted_files: Vec<&NzbFile> = files.iter().copied().collect();
+        sorted_files.sort_by_key(|f| std::cmp::Reverse(f.segments.segment.len()));
+
+        let download_futures = sorted_files.iter().map(|file| {
             let pool = self.pool.clone();
-            let semaphore = self.segment_semaphore.clone();
             let config = config.clone();
             let file = (*file).clone();
             let progress = progress_bar.clone();
@@ -154,7 +147,6 @@ impl Downloader {
                     file,
                     config,
                     pool,
-                    semaphore,
                     progress.clone(),
                 )
                 .await;
@@ -169,11 +161,11 @@ impl Downloader {
             }
         });
 
-        // Process downloads with controlled concurrency
-        // Use config value for file-level parallelism to better utilize connection pool
-        let file_concurrency = config.memory.max_concurrent_files.min(files.len());
+        // Process downloads with maximum concurrency for aggressive performance
+        // Download all files in parallel - no artificial file-level throttling
+        // The segment semaphore and connection pool provide the real limits
         let results: Vec<Result<DownloadResult>> = stream::iter(download_futures)
-            .buffer_unordered(file_concurrency)
+            .buffer_unordered(files.len())
             .collect()
             .await;
 
@@ -194,7 +186,6 @@ impl Downloader {
         file: NzbFile,
         config: Config,
         pool: NntpPool,
-        segment_semaphore: Arc<Semaphore>,
         progress_bar: ProgressBar,
     ) -> Result<DownloadResult> {
         let filename = Nzb::get_filename_from_subject(&file.subject)
@@ -207,96 +198,111 @@ impl Downloader {
         let output_file = File::create(&output_path).await?;
         let mut writer = BufWriter::with_capacity(config.memory.io_buffer_size, output_file);
 
-        // Prepare segment downloads
+        // Prepare segment downloads using pipelining
         let group = &file.groups.group[0].name; // Use first group
-        let segment_futures = file.segments.segment.iter().map(|segment| {
+
+        // Create segment requests
+        let mut segment_requests: Vec<SegmentRequest> = file.segments.segment
+            .iter()
+            .map(|segment| SegmentRequest {
+                message_id: segment.message_id.clone(),
+                group: group.clone(),
+                segment_number: segment.number,
+            })
+            .collect();
+
+        // Pipeline size: how many segments to request per connection
+        // Aggressive pipelining: 50 segments per connection for maximum throughput
+        let pipeline_size = 50;
+
+        // Split into batches for pipelining
+        let num_connections = config.usenet.connections as usize;
+        let batches: Vec<Vec<SegmentRequest>> = segment_requests
+            .chunks(pipeline_size)
+            .map(|chunk| chunk.to_vec())
+            .collect();
+
+        // Download batches in parallel using connection pool
+        let batch_futures = batches.into_iter().map(|batch| {
             let pool = pool.clone();
-            let semaphore = segment_semaphore.clone();
-            let message_id = segment.message_id.clone();
-            let group = group.clone();
-            let segment_number = segment.number;
-            let expected_bytes = segment.bytes;
             let progress = progress_bar.clone();
+            let segment_bytes: Vec<u64> = file.segments.segment.iter().map(|s| s.bytes).collect();
 
             async move {
-                // Acquire semaphore permit BEFORE downloading segment
-                // This enforces max_segments_in_memory limit
-                let _permit = semaphore.acquire().await.unwrap();
-
-                // Retry up to 3 times
-                for attempt in 0..3 {
-                    // Get connection from pool with timeout
-                    let mut conn =
-                        match tokio::time::timeout(Duration::from_secs(30), pool.get_connection())
-                            .await
-                        {
-                            Ok(Ok(conn)) => conn,
-                            Ok(Err(_)) | Err(_) => {
-                                if attempt == 2 {
-                                    // Last attempt failed
-                                    progress.inc(expected_bytes);
-                                    return Ok(SegmentResult {
-                                        segment_number,
-                                        data: None,
-                                        message_id: message_id.clone(),
-                                    });
-                                }
-                                // Small delay before retry to avoid overwhelming server
-                                tokio::time::sleep(Duration::from_millis(100)).await;
-                                continue;
-                            }
-                        };
-
-                    // Download segment with timeout
-                    let download_result = tokio::time::timeout(
-                        Duration::from_secs(60),
-                        conn.download_segment(&message_id, &group),
-                    )
-                    .await;
-
-                    match download_result {
-                        Ok(Ok(data)) => {
-                            // Success! Update progress and return
-                            progress.inc(expected_bytes);
-                            return Ok(SegmentResult {
-                                segment_number,
-                                data: Some(data),
-                                message_id: message_id.clone(),
-                            });
+                // Get connection from pool with retry logic
+                let mut conn = None;
+                for attempt in 0..2 {
+                    if attempt > 0 {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    match tokio::time::timeout(Duration::from_secs(60), pool.get_connection()).await {
+                        Ok(Ok(c)) => {
+                            conn = Some(c);
+                            break;
                         }
-                        Ok(Err(_)) | Err(_) => {
-                            // Failed or timed out
-                            if attempt == 2 {
-                                // Last attempt - give up
-                                progress.inc(expected_bytes);
-                                return Ok(SegmentResult {
-                                    segment_number,
-                                    data: None,
-                                    message_id: message_id.clone(),
-                                });
-                            }
-                            // Small delay before retry to avoid overwhelming server
-                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        _ if attempt == 1 => {
+                            tracing::error!("Failed to get connection from pool after retry");
+                            return batch.iter().map(|req| (req.segment_number, None)).collect();
                         }
+                        _ => continue,
                     }
                 }
+                let mut conn = conn.expect("connection should be set");
 
-                // Shouldn't reach here but just in case
-                progress.inc(expected_bytes);
-                Ok(SegmentResult {
-                    segment_number,
-                    data: None,
-                    message_id: message_id.clone(),
-                })
-                // Permit is dropped here, releasing memory slot
+
+                // Download pipelined batch
+                match conn.download_segments_pipelined(&batch).await {
+                    Ok(results) => {
+                        // Update progress for all segments
+                        for (seg_num, _) in &results {
+                            if let Some(idx) = (*seg_num as usize).checked_sub(1) {
+                                if idx < segment_bytes.len() {
+                                    progress.inc(segment_bytes[idx]);
+                                }
+                            }
+                        }
+                        results
+                    }
+                    Err(_) => {
+                        // Failed - update progress anyway
+                        for req in &batch {
+                            if let Some(idx) = (req.segment_number as usize).checked_sub(1) {
+                                if idx < segment_bytes.len() {
+                                    progress.inc(segment_bytes[idx]);
+                                }
+                            }
+                        }
+                        Vec::new()
+                    }
+                }
             }
         });
 
-        // Download segments with controlled concurrency
-        let segment_results: Vec<Result<SegmentResult>> = stream::iter(segment_futures)
-            .buffer_unordered(config.usenet.connections as usize)
+        // Execute batches matching connection pool size exactly
+        // This prevents timeout errors from queuing too many requests
+        let batch_results: Vec<Vec<(u32, Option<Bytes>)>> = stream::iter(batch_futures)
+            .buffer_unordered(num_connections)
             .collect()
             .await;
+
+        // Flatten results into segment_results format
+        let segment_results: Vec<Result<SegmentResult>> = batch_results
+            .into_iter()
+            .flatten()
+            .map(|(segment_number, data)| {
+                let message_id = file.segments.segment
+                    .iter()
+                    .find(|s| s.number == segment_number)
+                    .map(|s| s.message_id.clone())
+                    .unwrap_or_default();
+
+                Ok(SegmentResult {
+                    segment_number,
+                    data,
+                    message_id,
+                })
+            })
+            .collect();
 
         // Process results and write to file
         // Pre-allocate Vec for segment data (faster than HashMap)
@@ -314,10 +320,12 @@ impl Downloader {
                         segments_downloaded += 1;
                         actual_size += data.len() as u64;
                         // Segments are 1-indexed, Vec is 0-indexed
-                        if segment_result.segment_number > 0
-                            && segment_result.segment_number <= total_segments as u32
-                        {
-                            segment_data[(segment_result.segment_number - 1) as usize] = Some(data);
+                        let index = segment_result.segment_number.saturating_sub(1) as usize;
+                        if index < total_segments {
+                            segment_data[index] = Some(data);
+                        } else {
+                            tracing::warn!("Invalid segment number: {} (expected 1-{})",
+                                segment_result.segment_number, total_segments);
                         }
                     } else {
                         segments_failed += 1;

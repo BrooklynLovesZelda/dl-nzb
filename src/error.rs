@@ -29,6 +29,9 @@ pub enum DlNzbError {
 
     #[error("TLS error: {0}")]
     NativeTls(#[from] native_tls::Error),
+
+    #[error("JSON error: {0}")]
+    SerdeJson(#[from] serde_json::Error),
 }
 
 /// NZB parsing and validation errors

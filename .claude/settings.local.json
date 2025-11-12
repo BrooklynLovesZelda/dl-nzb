@@ -6,7 +6,17 @@
       "Bash(rm:*)",
       "Bash(awk:*)",
       "Bash(sort:*)",
-      "Bash(cargo clippy:*)"
+      "Bash(cargo clippy:*)",
+      "Bash(cargo check:*)",
+      "Bash(git submodule:*)",
+      "Bash(cargo build:*)",
+      "Bash(./target/debug/dl-nzb:*)",
+      "Bash(git worktree:*)",
+      "Bash(git --git-dir=/Users/zeph/Developer/experiments/dl-nzb/.git status)",
+      "Bash(git add:*)",
+      "Bash(git log:*)",
+      "Bash(./target/release/dl-nzb config:*)",
+      "Bash(find:*)"
     ],
     "deny": []
   }

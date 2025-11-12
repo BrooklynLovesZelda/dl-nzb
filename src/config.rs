@@ -42,7 +42,7 @@ pub struct Config {
     pub logging: LoggingConfig,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct UsenetConfig {
     pub server: String,
     pub port: u16,
@@ -54,6 +54,24 @@ pub struct UsenetConfig {
     pub timeout: u64, // seconds
     pub retry_attempts: u8,
     pub retry_delay: u64, // milliseconds
+}
+
+// Custom Debug implementation to hide sensitive data
+impl std::fmt::Debug for UsenetConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UsenetConfig")
+            .field("server", &self.server)
+            .field("port", &self.port)
+            .field("username", &self.username)
+            .field("password", &"<REDACTED>")
+            .field("ssl", &self.ssl)
+            .field("verify_ssl_certs", &self.verify_ssl_certs)
+            .field("connections", &self.connections)
+            .field("timeout", &self.timeout)
+            .field("retry_attempts", &self.retry_attempts)
+            .field("retry_delay", &self.retry_delay)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,7 +114,7 @@ impl Default for UsenetConfig {
             password: String::new(),
             ssl: true, // Default to SSL
             verify_ssl_certs: true,
-            connections: 30,   // Optimized default
+            connections: 40,   // Good default for most providers (many allow 50)
             timeout: 45,       // Longer for large segments
             retry_attempts: 2, // Faster failover
             retry_delay: 500,  // Quick retries
@@ -117,9 +135,9 @@ impl Default for DownloadConfig {
 impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
-            max_segments_in_memory: 100,
-            io_buffer_size: 8 * 1024 * 1024, // 8MB (optimized)
-            max_concurrent_files: 10,
+            max_segments_in_memory: 3000,    // Ultra-aggressive: 3000 concurrent segments (60x per connection)
+            io_buffer_size: 16 * 1024 * 1024, // 16MB buffer
+            max_concurrent_files: 100,        // No longer throttles (downloader ignores this)
         }
     }
 }
@@ -399,7 +417,7 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = Config::default();
-        assert_eq!(config.usenet.connections, 30);
+        assert_eq!(config.usenet.connections, 40); // Updated default
         assert_eq!(config.memory.io_buffer_size, 8 * 1024 * 1024);
     }
 

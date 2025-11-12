@@ -105,7 +105,16 @@ impl PooledConnection {
     ) -> Result<Bytes, DlNzbError> {
         self.conn
             .download_segment(message_id, group)
-            .await}
+            .await
+    }
+
+    /// Download multiple segments using pipelining
+    pub async fn download_segments_pipelined(
+        &mut self,
+        requests: &[crate::nntp::SegmentRequest],
+    ) -> Result<Vec<(u32, Option<Bytes>)>, DlNzbError> {
+        self.conn.download_segments_pipelined(requests).await
+    }
 }
 
 /// Builder for creating connection pools with configuration
@@ -121,7 +130,7 @@ impl NntpPoolBuilder {
             max_size: config.connections as usize,
             config,
             timeouts: deadpool::managed::Timeouts {
-                wait: Some(Duration::from_secs(30)),
+                wait: Some(Duration::from_secs(120)), // Longer wait for high-speed pipelining
                 create: Some(Duration::from_secs(30)),
                 recycle: Some(Duration::from_secs(5)),
             },

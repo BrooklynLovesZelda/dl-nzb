@@ -1,168 +1,137 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
-/// A high-performance NZB downloader for Usenet
+/// Fast NZB downloader for Usenet
 #[derive(Parser, Debug)]
 #[command(name = "dl-nzb")]
 #[command(version, about, long_about = None)]
 #[command(after_help = "EXAMPLES:
-    # Download an NZB file
-    dl-nzb file.nzb
+    Download an NZB file:
+        dl-nzb file.nzb
 
-    # Download with custom output directory
-    dl-nzb file.nzb -o /path/to/downloads
+    Download to specific directory:
+        dl-nzb -o /downloads file.nzb
 
-    # Download with increased connections
-    dl-nzb file.nzb -c 50
+    List contents without downloading:
+        dl-nzb -l file.nzb
 
-    # Download multiple NZB files
-    dl-nzb file1.nzb file2.nzb file3.nzb
+    Show configuration:
+        dl-nzb config
 
-    # List contents without downloading
-    dl-nzb -l file.nzb
+    Test connection:
+        dl-nzb test
 
-    # Continue partial download
-    dl-nzb -c file.nzb
-
-    # Show current configuration
-    dl-nzb config")]
+For advanced options, edit ~/.config/dl-nzb/config.toml")]
 pub struct Cli {
     /// NZB files to download
     #[arg(value_name = "FILE")]
     pub files: Vec<PathBuf>,
 
-    // Network Options
-    /// Maximum number of simultaneous connections
-    #[arg(short = 'c', long, value_name = "NUM")]
-    pub connections: Option<u16>,
-
-    // Download Options
     /// Output directory
-    #[arg(short = 'o', long = "output-dir", value_name = "DIR")]
-    pub output_dir: Option<PathBuf>,
+    #[arg(short, long, value_name = "DIR")]
+    pub output: Option<PathBuf>,
 
-    /// Don't create subdirectories
-    #[arg(long = "no-directories")]
-    pub no_directories: bool,
-
-    /// Keep partial files on error
-    #[arg(long = "keep-partial")]
-    pub keep_partial: bool,
-
-    // Post-processing Options
-    /// Skip PAR2 verification and repair
-    #[arg(long = "no-par2")]
-    pub no_par2: bool,
-
-    /// Skip RAR archive extraction
-    #[arg(long = "no-extract-rar")]
-    pub no_extract_rar: bool,
-
-    /// Delete RAR archives after extraction
-    #[arg(long = "delete-rar-after-extract")]
-    pub delete_rar_after_extract: bool,
-
-    /// Delete PAR2 files after successful repair
-    #[arg(long = "delete-par2")]
-    pub delete_par2: bool,
-
-    // Information Options
-    /// List NZB contents without downloading
-    #[arg(short = 'l', long = "list")]
+    /// List contents without downloading
+    #[arg(short, long)]
     pub list: bool,
 
-    /// Quiet mode (no output except errors)
-    #[arg(short = 'q', long = "quiet")]
+    /// Quiet mode (errors only)
+    #[arg(short, long)]
     pub quiet: bool,
 
-    /// Verbose output
-    #[arg(short = 'v', long = "verbose", action = clap::ArgAction::Count)]
+    /// Verbose output (-vv for debug)
+    #[arg(short, long, action = clap::ArgAction::Count)]
     pub verbose: u8,
 
-    /// Print downloaded file paths to stdout
-    #[arg(long = "print-names")]
-    pub print_names: bool,
+    /// JSON output for scripting
+    #[arg(long)]
+    pub json: bool,
 
-    // Server Override Options
-    /// Usenet server address (overrides config)
-    #[arg(long = "server", value_name = "HOST")]
-    pub server: Option<String>,
+    /// Config file path
+    #[arg(long, value_name = "FILE")]
+    pub config: Option<PathBuf>,
 
-    /// Usenet server port (overrides config)
-    #[arg(long = "port", value_name = "PORT")]
-    pub port: Option<u16>,
+    /// Force operation (skip confirmations)
+    #[arg(short, long)]
+    pub force: bool,
 
-    /// Use SSL/TLS connection (overrides config)
-    #[arg(long = "ssl")]
-    pub ssl: Option<bool>,
-
-    /// Usenet username (overrides config)
-    #[arg(short = 'u', long = "user", value_name = "USER")]
-    pub username: Option<String>,
-
-    /// Usenet password (overrides config, use - for stdin)
-    #[arg(short = 'p', long = "password", value_name = "PASS")]
-    pub password: Option<String>,
-
-    // Advanced Options
-    /// Memory limit for segment buffering (MB)
-    #[arg(long = "memory-limit", value_name = "MB")]
-    pub memory_limit: Option<usize>,
-
-    /// I/O buffer size (KB)
-    #[arg(long = "buffer-size", value_name = "KB", default_value = "4096")]
-    pub buffer_size: usize,
-
-    /// Maximum concurrent file downloads
-    #[arg(long = "max-concurrent-files", value_name = "NUM", default_value = "5")]
-    pub max_concurrent_files: usize,
-
-    /// Log level (error, warn, info, debug, trace)
-    #[arg(long = "log-level", value_name = "LEVEL")]
-    pub log_level: Option<String>,
-
-    /// Log file path
-    #[arg(long = "log-file", value_name = "FILE")]
-    pub log_file: Option<PathBuf>,
-
-    /// Subcommands for additional functionality
+    /// Subcommands
     #[command(subcommand)]
     pub command: Option<Commands>,
+
+    // Hidden flags kept for backwards compatibility with scripts
+    // These will be removed in future versions
+    #[arg(short = 'c', long = "connections", hide = true)]
+    pub connections: Option<u16>,
+
+    #[arg(long = "output-dir", hide = true)]
+    pub output_dir: Option<PathBuf>,
+
+    #[arg(long = "no-resume", hide = true)]
+    pub no_resume: bool,
+
+    #[arg(long = "no-directories", hide = true)]
+    pub no_directories: bool,
+
+    #[arg(long = "keep-partial", hide = true)]
+    pub keep_partial: bool,
+
+    #[arg(long = "no-par2", hide = true)]
+    pub no_par2: bool,
+
+    #[arg(long = "no-extract-rar", hide = true)]
+    pub no_extract_rar: bool,
+
+    #[arg(long = "delete-rar-after-extract", hide = true)]
+    pub delete_rar_after_extract: bool,
+
+    #[arg(long = "delete-par2", hide = true)]
+    pub delete_par2: bool,
+
+    #[arg(long = "print-names", hide = true)]
+    pub print_names: bool,
+
+    #[arg(long = "server", hide = true)]
+    pub server: Option<String>,
+
+    #[arg(long = "port", hide = true)]
+    pub port: Option<u16>,
+
+    #[arg(long = "ssl", hide = true)]
+    pub ssl: Option<bool>,
+
+    #[arg(short = 'u', long = "user", hide = true)]
+    pub username: Option<String>,
+
+    #[arg(short = 'p', long = "password", hide = true)]
+    pub password: Option<String>,
+
+    #[arg(long = "memory-limit", hide = true)]
+    pub memory_limit: Option<usize>,
+
+    #[arg(long = "buffer-size", hide = true)]
+    pub buffer_size: Option<usize>,
+
+    #[arg(long = "max-concurrent-files", hide = true)]
+    pub max_concurrent_files: Option<usize>,
+
+    #[arg(long = "log-level", hide = true)]
+    pub log_level: Option<String>,
+
+    #[arg(long = "log-file", hide = true)]
+    pub log_file: Option<PathBuf>,
 }
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
     /// Test connection to Usenet server
-    Test {
-        /// Test with specific server
-        #[arg(long = "server")]
-        server: Option<String>,
-    },
+    Test,
 
-    /// Show configuration file location and contents
+    /// Show configuration
     Config,
 
-    /// Manage download history and cache
-    History {
-        /// Show download history
-        #[arg(long = "show")]
-        show: bool,
-
-        /// Clear download history
-        #[arg(long = "clear")]
-        clear: bool,
-
-        /// Remove specific entry
-        #[arg(long = "remove", value_name = "ID")]
-        remove: Option<String>,
-    },
-
-    /// Show version and build information
-    Version {
-        /// Show detailed version info
-        #[arg(long = "detailed")]
-        detailed: bool,
-    },
+    /// Show version information
+    Version,
 }
 
 impl Cli {
@@ -170,13 +139,30 @@ impl Cli {
     pub fn parse_and_validate() -> Self {
         let mut cli = Self::parse();
 
-        // Handle password from stdin
+        // Handle backwards compatibility
+        if cli.output_dir.is_some() && cli.output.is_none() {
+            cli.output = cli.output_dir.clone();
+            eprintln!("Warning: --output-dir is deprecated, use -o/--output instead");
+        }
+
+        // Handle password from stdin (kept for backwards compat)
         if cli.password.as_deref() == Some("-") {
             use std::io::{self, BufRead};
             let stdin = io::stdin();
             if let Ok(password) = stdin.lock().lines().next().unwrap_or(Ok(String::new())) {
                 cli.password = Some(password);
             }
+        }
+
+        // Print deprecation warnings for hidden flags if used
+        if cli.connections.is_some() {
+            eprintln!("Warning: --connections is deprecated, set 'connections' in config file");
+        }
+        if cli.no_par2 {
+            eprintln!("Warning: --no-par2 is deprecated, set 'auto_par2_repair = false' in config file");
+        }
+        if cli.no_extract_rar {
+            eprintln!("Warning: --no-extract-rar is deprecated, set 'auto_extract_rar = false' in config file");
         }
 
         // Adjust verbosity based on quiet flag
@@ -208,9 +194,31 @@ impl Cli {
             port: self.port,
             connections: self.connections,
             ssl: self.ssl,
-            download_dir: self.output_dir.clone(),
+            download_dir: self.output.clone(),
             log_level: self.log_level.clone(),
         }
+    }
+
+    /// Check if deprecated flags are used
+    pub fn has_deprecated_flags(&self) -> bool {
+        self.connections.is_some()
+            || self.output_dir.is_some()
+            || self.no_resume
+            || self.no_directories
+            || self.keep_partial
+            || self.no_par2
+            || self.no_extract_rar
+            || self.delete_rar_after_extract
+            || self.delete_par2
+            || self.print_names
+            || self.server.is_some()
+            || self.port.is_some()
+            || self.ssl.is_some()
+            || self.username.is_some()
+            || self.password.is_some()
+            || self.memory_limit.is_some()
+            || self.buffer_size.is_some()
+            || self.max_concurrent_files.is_some()
     }
 }
 

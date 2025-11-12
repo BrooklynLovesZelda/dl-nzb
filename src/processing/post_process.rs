@@ -514,14 +514,31 @@ impl PostProcessor {
                                 file_count
                             ));
 
+                            // Sanitize filename to prevent path traversal attacks
+                            let safe_filename = filename
+                                .components()
+                                .filter(|c| matches!(c, std::path::Component::Normal(_)))
+                                .collect::<PathBuf>();
+
+                            if safe_filename.as_os_str().is_empty() {
+                                tracing::warn!("Skipping file with invalid name: {}", filename.display());
+                                match header.skip() {
+                                    Ok(next_archive) => {
+                                        archive = next_archive;
+                                        continue;
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+
                             // Ensure parent directory exists for nested files
-                            let output_path = output_dir.join(&filename);
+                            let output_path = output_dir.join(&safe_filename);
                             if let Some(parent) = output_path.parent() {
                                 std::fs::create_dir_all(parent)?;
                             }
 
-                            // Extract file
-                            match header.extract_with_base(output_dir) {
+                            // Extract file with sanitized path
+                            match header.extract_to(&output_path) {
                                 Ok(next_archive) => {
                                     archive = next_archive;
                                     extracted_files += 1;

@@ -6,5 +6,5 @@
 mod connection;
 mod pool;
 
-pub use connection::AsyncNntpConnection;
+pub use connection::{AsyncNntpConnection, SegmentRequest};
 pub use pool::{NntpPool, NntpPoolBuilder, NntpPoolExt, PooledConnection};

@@ -30,6 +30,7 @@ pub mod cli;
 pub mod config;
 pub mod error;
 pub mod progress;
+pub mod json_output;
 
 // Feature modules organized by functionality
 pub mod download;
@@ -42,3 +43,6 @@ pub use download::{DownloadResult, Downloader, Nzb};
 pub use error::{DlNzbError, Result};
 pub use nntp::{NntpPool, NntpPoolBuilder, NntpPoolExt};
 pub use processing::PostProcessor;
+
+// Re-export serde_json for binary
+pub use serde_json;

@@ -17,6 +17,14 @@ pub struct AsyncNntpConnection {
     current_group: Option<String>,
 }
 
+/// Request for pipelined downloading
+#[derive(Clone)]
+pub struct SegmentRequest {
+    pub message_id: String,
+    pub group: String,
+    pub segment_number: u32,
+}
+
 impl AsyncNntpConnection {
     /// Create a new NNTP connection with optional shared TLS connector
     ///
@@ -78,7 +86,7 @@ impl AsyncNntpConnection {
             (Box::new(read_half), Box::new(write_half))
         };
 
-        let reader = BufReader::with_capacity(64 * 1024, reader);
+        let reader = BufReader::with_capacity(256 * 1024, reader); // 256KB read buffer for pipelining
 
         let mut conn = Self {
             writer,
@@ -118,10 +126,14 @@ impl AsyncNntpConnection {
             let response = self.read_response().await?;
 
             if !response.starts_with("281") {
-                return Err(NntpError::AuthFailed(response).into());
+                // Sanitize response to avoid leaking sensitive info
+                let sanitized = response.split_whitespace().next().unwrap_or("Unknown");
+                return Err(NntpError::AuthFailed(format!("Authentication failed ({})", sanitized)).into());
             }
         } else if !response.starts_with("281") {
-            return Err(NntpError::AuthFailed(response).into());
+            // Sanitize response to avoid leaking sensitive info
+            let sanitized = response.split_whitespace().next().unwrap_or("Unknown");
+            return Err(NntpError::AuthFailed(format!("Authentication failed ({})", sanitized)).into());
         }
 
         Ok(())
@@ -156,7 +168,7 @@ impl AsyncNntpConnection {
             .into());
         }
 
-        // Read and decode the body with timeout
+        // Read and decode the body
         let encoded_data = timeout(Duration::from_secs(30), self.read_article_body())
             .await
             .map_err(|_| NntpError::Timeout { seconds: 30 })??;
@@ -171,7 +183,7 @@ impl AsyncNntpConnection {
     async fn read_article_body(&mut self) -> Result<Vec<u8>> {
         use tokio::io::AsyncBufReadExt;
 
-        let mut body = Vec::with_capacity(512 * 1024); // Pre-allocate 512KB
+        let mut body = Vec::with_capacity(1024 * 1024); // Pre-allocate 1MB for larger segments
         let mut line = Vec::new();
 
         loop {
@@ -280,6 +292,94 @@ impl AsyncNntpConnection {
             },
             Err(_) => false,
         }
+    }
+
+    /// Download multiple segments using pipelining for maximum throughput
+    ///
+    /// This sends multiple BODY commands before waiting for responses,
+    /// dramatically reducing round-trip latency overhead
+    pub async fn download_segments_pipelined(
+        &mut self,
+        requests: &[SegmentRequest],
+    ) -> Result<Vec<(u32, Option<Bytes>)>> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Switch to the group if needed (all requests should be from same group)
+        let group = &requests[0].group;
+        if self.current_group.as_deref() != Some(group) {
+            self.send_command(&format!("GROUP {}", group)).await?;
+            let response = timeout(Duration::from_secs(10), self.read_response())
+                .await
+                .map_err(|_| NntpError::Timeout { seconds: 10 })??;
+            if !response.starts_with("211") {
+                return Err(NntpError::GroupNotFound {
+                    group: group.to_string(),
+                }
+                .into());
+            }
+            self.current_group = Some(group.to_string());
+        }
+
+        // Pipeline all BODY requests - send them all without waiting
+        for req in requests {
+            self.writer
+                .write_all(format!("BODY <{}>\r\n", req.message_id).as_bytes())
+                .await?;
+        }
+        self.writer.flush().await?;
+
+        // Now read all responses in order
+        let mut results = Vec::with_capacity(requests.len());
+
+        for req in requests {
+            // Read response code
+            let response = match timeout(Duration::from_secs(10), self.read_response()).await {
+                Ok(Ok(r)) => r,
+                _ => {
+                    results.push((req.segment_number, None));
+                    continue;
+                }
+            };
+
+            if !response.starts_with("222") {
+                // Article not found or error - we still need to read the body if server sent one
+                // to keep the connection in sync for remaining pipelined responses
+                if response.starts_with("430") || response.starts_with("423") {
+                    // 430 = no such article, 423 = no such article number
+                    // These don't send a body, safe to skip
+                    results.push((req.segment_number, None));
+                    continue;
+                } else {
+                    // Unknown response, try to read body anyway to avoid desync
+                    let _ = timeout(Duration::from_secs(30), self.read_article_body()).await;
+                    results.push((req.segment_number, None));
+                    continue;
+                }
+            }
+
+            // Read and decode the body
+            let encoded_data = match timeout(Duration::from_secs(30), self.read_article_body()).await {
+                Ok(Ok(data)) => data,
+                _ => {
+                    results.push((req.segment_number, None));
+                    continue;
+                }
+            };
+
+            // Decode yEnc
+            match self.decode_yenc_simple(&encoded_data) {
+                Ok(decoded) => {
+                    results.push((req.segment_number, Some(Bytes::from(decoded))));
+                }
+                Err(_) => {
+                    results.push((req.segment_number, None));
+                }
+            }
+        }
+
+        Ok(results)
     }
 
     /// Close the connection gracefully
