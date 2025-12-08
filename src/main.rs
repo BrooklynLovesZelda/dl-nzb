@@ -461,6 +461,11 @@ async fn handle_download_mode(cli: &Cli, mut config: Config) -> Result<()> {
         }
     }
 
+    // Terminal bell to notify completion (skip in quiet/json mode)
+    if !cli.quiet && !cli.json {
+        print!("\x07");
+    }
+
     Ok(())
 }
 
