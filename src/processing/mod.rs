@@ -4,6 +4,8 @@
 
 mod deobfuscate;
 mod file_extension;
-mod post_process;
+mod par2;
+mod post_processor;
+mod rar;
 
-pub use post_process::PostProcessor;
+pub use post_processor::PostProcessor;

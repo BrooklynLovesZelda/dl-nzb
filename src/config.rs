@@ -23,8 +23,7 @@ fn expand_tilde(path: &Path) -> PathBuf {
 }
 
 /// Main configuration structure with builder pattern support
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
     #[serde(default)]
     pub usenet: UsenetConfig,
@@ -40,6 +39,9 @@ pub struct Config {
 
     #[serde(default)]
     pub logging: LoggingConfig,
+
+    #[serde(default)]
+    pub tuning: TuningConfig,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -106,6 +108,20 @@ pub struct LoggingConfig {
     pub format: String,
 }
 
+/// Performance tuning parameters
+/// These are advanced settings that typically don't need adjustment
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TuningConfig {
+    /// Number of segments to request per connection in a pipeline batch
+    pub pipeline_size: usize,
+    /// Maximum time (seconds) to wait for a pool connection before skipping batch
+    pub connection_wait_timeout: u64,
+    /// Maximum concurrent connection creation attempts
+    pub max_concurrent_connections: usize,
+    /// File size threshold (bytes) above which to show progress during RAR extraction
+    pub large_file_threshold: u64,
+}
+
 // Default implementations
 impl Default for UsenetConfig {
     fn default() -> Self {
@@ -116,8 +132,8 @@ impl Default for UsenetConfig {
             password: String::new(),
             ssl: true, // Default to SSL
             verify_ssl_certs: true,
-            connections: 40,   // Good default for most providers (many allow 50)
-            timeout: 45,       // Longer for large segments
+            connections: 20,   // Conservative default (users can increase if needed)
+            timeout: 30,       // Reduced from 45s
             retry_attempts: 2, // Faster failover
             retry_delay: 500,  // Quick retries
         }
@@ -138,9 +154,9 @@ impl Default for DownloadConfig {
 impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
-            max_segments_in_memory: 3000,    // Ultra-aggressive: 3000 concurrent segments (60x per connection)
-            io_buffer_size: 16 * 1024 * 1024, // 16MB buffer
-            max_concurrent_files: 100,        // No longer throttles (downloader ignores this)
+            max_segments_in_memory: 800, // Conservative: 800 concurrent segments (~20 per connection)
+            io_buffer_size: 8 * 1024 * 1024, // 8MB buffer (reduced from 16MB)
+            max_concurrent_files: 100,   // No longer throttles (downloader ignores this)
         }
     }
 }
@@ -167,6 +183,16 @@ impl Default for LoggingConfig {
     }
 }
 
+impl Default for TuningConfig {
+    fn default() -> Self {
+        Self {
+            pipeline_size: 50,                      // Segments per connection batch
+            connection_wait_timeout: 300,           // 5 minutes max wait
+            max_concurrent_connections: 10,         // Concurrent connection creation limit
+            large_file_threshold: 10 * 1024 * 1024, // 10MB for progress monitoring
+        }
+    }
+}
 
 /// Load configuration from environment variables
 fn load_env_overrides(mut config: Config) -> Config {
@@ -420,7 +446,7 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = Config::default();
-        assert_eq!(config.usenet.connections, 40); // Updated default
+        assert_eq!(config.usenet.connections, 20); // Conservative default
         assert_eq!(config.memory.io_buffer_size, 8 * 1024 * 1024);
     }
 

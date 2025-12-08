@@ -2,7 +2,7 @@ use bytes::Bytes;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
-use tokio::time::{Duration, timeout};
+use tokio::time::{timeout, Duration};
 use tokio_native_tls::TlsConnector;
 
 use crate::config::UsenetConfig;
@@ -128,12 +128,18 @@ impl AsyncNntpConnection {
             if !response.starts_with("281") {
                 // Sanitize response to avoid leaking sensitive info
                 let sanitized = response.split_whitespace().next().unwrap_or("Unknown");
-                return Err(NntpError::AuthFailed(format!("Authentication failed ({})", sanitized)).into());
+                return Err(NntpError::AuthFailed(format!(
+                    "Authentication failed ({})",
+                    sanitized
+                ))
+                .into());
             }
         } else if !response.starts_with("281") {
             // Sanitize response to avoid leaking sensitive info
             let sanitized = response.split_whitespace().next().unwrap_or("Unknown");
-            return Err(NntpError::AuthFailed(format!("Authentication failed ({})", sanitized)).into());
+            return Err(
+                NntpError::AuthFailed(format!("Authentication failed ({})", sanitized)).into(),
+            );
         }
 
         Ok(())
@@ -360,13 +366,14 @@ impl AsyncNntpConnection {
             }
 
             // Read and decode the body
-            let encoded_data = match timeout(Duration::from_secs(30), self.read_article_body()).await {
-                Ok(Ok(data)) => data,
-                _ => {
-                    results.push((req.segment_number, None));
-                    continue;
-                }
-            };
+            let encoded_data =
+                match timeout(Duration::from_secs(30), self.read_article_body()).await {
+                    Ok(Ok(data)) => data,
+                    _ => {
+                        results.push((req.segment_number, None));
+                        continue;
+                    }
+                };
 
             // Decode yEnc
             match self.decode_yenc_simple(&encoded_data) {

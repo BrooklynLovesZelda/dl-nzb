@@ -23,7 +23,7 @@ pub struct DownloadResult {
     pub segments_downloaded: usize,
     pub segments_failed: usize,
     pub download_time: Duration,
-    pub average_speed: f64, // MB/s
+    pub average_speed: f64,              // MB/s
     pub failed_message_ids: Vec<String>, // Track failed segments for potential retry
 }
 
@@ -131,25 +131,23 @@ impl Downloader {
         let total_files = files.len();
         let completed_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
+        // Wrap config in Arc to avoid cloning per-file (Config contains strings and paths)
+        let config = std::sync::Arc::new(config);
+
         // Sort files by size (largest first) to maximize initial throughput
         let mut sorted_files: Vec<&NzbFile> = files.iter().copied().collect();
         sorted_files.sort_by_key(|f| std::cmp::Reverse(f.segments.segment.len()));
 
         let download_futures = sorted_files.iter().map(|file| {
             let pool = self.pool.clone();
-            let config = config.clone();
+            let config = config.clone(); // Now clones Arc, not Config
             let file = (*file).clone();
             let progress = progress_bar.clone();
             let completed = completed_count.clone();
 
             async move {
-                let result = Self::download_file_with_pool(
-                    file,
-                    config,
-                    pool,
-                    progress.clone(),
-                )
-                .await;
+                let result =
+                    Self::download_file_with_pool(file, &config, pool, progress.clone()).await;
 
                 // Update file counter (only update every 5 files to reduce overhead)
                 let count = completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
@@ -161,11 +159,12 @@ impl Downloader {
             }
         });
 
-        // Process downloads with maximum concurrency for aggressive performance
-        // Download all files in parallel - no artificial file-level throttling
-        // The segment semaphore and connection pool provide the real limits
+        // Process downloads with bounded concurrency to prevent pool exhaustion
+        // Each file uses multiple connections for its batches, so limit concurrent files
+        // to avoid total_batches = files × batches_per_file >> pool_size
+        let max_concurrent_files = (config.usenet.connections as usize / 5).max(2);
         let results: Vec<Result<DownloadResult>> = stream::iter(download_futures)
-            .buffer_unordered(files.len())
+            .buffer_unordered(max_concurrent_files)
             .collect()
             .await;
 
@@ -184,7 +183,7 @@ impl Downloader {
     /// Download a single file using the connection pool
     async fn download_file_with_pool(
         file: NzbFile,
-        config: Config,
+        config: &Config,
         pool: NntpPool,
         progress_bar: ProgressBar,
     ) -> Result<DownloadResult> {
@@ -199,7 +198,12 @@ impl Downloader {
             let expected_size: u64 = file.segments.segment.iter().map(|s| s.bytes).sum();
             if let Ok(metadata) = tokio::fs::metadata(&output_path).await {
                 if metadata.len() == expected_size {
-                    tracing::info!("File already complete, skipping: {}", filename);
+                    // Log skip using progress bar for clean output
+                    if progress_bar.is_hidden() {
+                        eprintln!("  Skipping complete: {}", filename);
+                    } else {
+                        progress_bar.println(format!("  \x1b[90m↳ Skipping: {}\x1b[0m", filename));
+                    }
                     return Ok(DownloadResult {
                         filename,
                         path: output_path,
@@ -224,7 +228,9 @@ impl Downloader {
         let group = &file.groups.group[0].name; // Use first group
 
         // Create segment requests
-        let segment_requests: Vec<SegmentRequest> = file.segments.segment
+        let segment_requests: Vec<SegmentRequest> = file
+            .segments
+            .segment
             .iter()
             .map(|segment| SegmentRequest {
                 message_id: segment.message_id.clone(),
@@ -234,8 +240,7 @@ impl Downloader {
             .collect();
 
         // Pipeline size: how many segments to request per connection
-        // Aggressive pipelining: 50 segments per connection for maximum throughput
-        let pipeline_size = 50;
+        let pipeline_size = config.tuning.pipeline_size;
 
         // Split into batches for pipelining
         let num_connections = config.usenet.connections as usize;
@@ -245,32 +250,64 @@ impl Downloader {
             .collect();
 
         // Download batches in parallel using connection pool
+        let connection_wait_timeout = config.tuning.connection_wait_timeout;
         let batch_futures = batches.into_iter().map(|batch| {
             let pool = pool.clone();
             let progress = progress_bar.clone();
             let segment_bytes: Vec<u64> = file.segments.segment.iter().map(|s| s.bytes).collect();
 
             async move {
-                // Get connection from pool with retry logic
+                // Get connection from pool with patient retry
+                // Keep trying until we get a connection - don't fail segments due to pool contention
                 let mut conn = None;
-                for attempt in 0..2 {
+                let mut attempt = 0u32;
+                let start = Instant::now();
+                let max_wait = Duration::from_secs(connection_wait_timeout);
+
+                while conn.is_none() && start.elapsed() < max_wait {
                     if attempt > 0 {
-                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        // Exponential backoff: 500ms, 1s, 2s, 4s, 8s (capped)
+                        let delay = Duration::from_millis(500) * (1 << attempt.min(4));
+                        tokio::time::sleep(delay).await;
+
+                        // Show feedback after several retries (every ~15s)
+                        if attempt % 5 == 0 && !progress.is_hidden() {
+                            progress.println(format!(
+                                "  \x1b[90m⏳ Waiting for connection... ({:.0}s)\x1b[0m",
+                                start.elapsed().as_secs_f64()
+                            ));
+                        }
                     }
-                    match tokio::time::timeout(Duration::from_secs(60), pool.get_connection()).await {
+
+                    match tokio::time::timeout(Duration::from_secs(60), pool.get_connection()).await
+                    {
                         Ok(Ok(c)) => {
                             conn = Some(c);
-                            break;
                         }
-                        _ if attempt == 1 => {
-                            tracing::error!("Failed to get connection from pool after retry");
-                            return batch.iter().map(|req| (req.segment_number, None)).collect();
+                        Ok(Err(_)) | Err(_) => {
+                            // Connection failed or timed out, will retry
+                            attempt += 1;
                         }
-                        _ => continue,
                     }
                 }
-                let mut conn = conn.expect("connection should be set");
 
+                let mut conn = match conn {
+                    Some(c) => c,
+                    None => {
+                        // Only warn after exhausting retries
+                        if progress.is_hidden() {
+                            eprintln!(
+                                "  Warning: Could not get connection after {:?}",
+                                start.elapsed()
+                            );
+                        } else {
+                            progress.println(format!(
+                                "  \x1b[33m⚠ Connection unavailable, batch skipped\x1b[0m"
+                            ));
+                        }
+                        return batch.iter().map(|req| (req.segment_number, None)).collect();
+                    }
+                };
 
                 // Download pipelined batch
                 match conn.download_segments_pipelined(&batch).await {
@@ -312,7 +349,9 @@ impl Downloader {
             .into_iter()
             .flatten()
             .map(|(segment_number, data)| {
-                let message_id = file.segments.segment
+                let message_id = file
+                    .segments
+                    .segment
                     .iter()
                     .find(|s| s.number == segment_number)
                     .map(|s| s.message_id.clone())
@@ -346,8 +385,11 @@ impl Downloader {
                         if index < total_segments {
                             segment_data[index] = Some(data);
                         } else {
-                            tracing::warn!("Invalid segment number: {} (expected 1-{})",
-                                segment_result.segment_number, total_segments);
+                            tracing::debug!(
+                                "Invalid segment number: {} (expected 1-{})",
+                                segment_result.segment_number,
+                                total_segments
+                            );
                         }
                     } else {
                         segments_failed += 1;
@@ -395,11 +437,11 @@ impl Downloader {
             if result.segments_failed > 0 && result.path.exists() {
                 match tokio::fs::remove_file(&result.path).await {
                     Ok(_) => {
-                        tracing::info!("Cleaned up partial file: {}", result.path.display());
+                        tracing::debug!("Cleaned up partial file: {}", result.path.display());
                         cleaned_count += 1;
                     }
                     Err(e) => {
-                        tracing::warn!("Failed to clean up {}: {}", result.path.display(), e);
+                        tracing::debug!("Failed to clean up {}: {}", result.path.display(), e);
                     }
                 }
             }

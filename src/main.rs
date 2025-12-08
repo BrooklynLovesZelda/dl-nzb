@@ -7,7 +7,10 @@ use dl_nzb::{
     config::Config,
     download::{Downloader, Nzb},
     error::{ConfigError, DlNzbError},
-    json_output::{NzbInfo, FileInfo, TestResult, ErrorOutput},
+    json_output::{
+        DownloadFileResult, DownloadSummary, ErrorOutput, FileInfo, NzbInfo, PostProcessingResult,
+        TestResult,
+    },
     nntp::AsyncNntpConnection,
     processing::PostProcessor,
     serde_json,
@@ -26,9 +29,11 @@ async fn main() {
     if let Err(e) = run(cli).await {
         if use_json {
             let error_output = ErrorOutput::from_error(&e);
-            eprintln!("{}", serde_json::to_string_pretty(&error_output).unwrap_or_else(|_| {
-                format!(r#"{{"error": "Failed to serialize error"}}"#)
-            }));
+            eprintln!(
+                "{}",
+                serde_json::to_string_pretty(&error_output)
+                    .unwrap_or_else(|_| { format!(r#"{{"error": "Failed to serialize error"}}"#) })
+            );
         } else {
             eprintln!("Error: {}", e);
             let mut source = e.source();
@@ -42,7 +47,6 @@ async fn main() {
 }
 
 async fn run(cli: Cli) -> Result<()> {
-
     // Initialize logging
     init_logging(&cli)?;
 
@@ -62,10 +66,7 @@ async fn run(cli: Cli) -> Result<()> {
         eprintln!("Note: Some flags used are deprecated. See --help for current usage.");
     }
 
-    // Note: no_resume flag handling removed as resume field was removed from config
-    // This could be re-added if needed
-
-    // Handle username/password from CLI (backwards compat)
+    // Handle username/password from CLI
     if let Some(username) = &cli.username {
         config.usenet.username = username.clone();
     }
@@ -93,7 +94,10 @@ async fn run(cli: Cli) -> Result<()> {
 
 /// Initialize logging based on CLI arguments
 fn init_logging(cli: &Cli) -> Result<()> {
-    let filter = EnvFilter::try_new(cli.get_log_level()).unwrap_or_else(|_| EnvFilter::new("info"));
+    // Base filter from CLI, but suppress par2-rs logs (they break progress bars)
+    let filter = EnvFilter::try_new(cli.get_log_level())
+        .unwrap_or_else(|_| EnvFilter::new("info"))
+        .add_directive("par2_rs=off".parse().unwrap());
 
     let subscriber = tracing_subscriber::fmt()
         .with_env_filter(filter)
@@ -219,19 +223,23 @@ async fn handle_list_mode(cli: &Cli) -> Result<()> {
         for nzb_path in &cli.files {
             let nzb = Nzb::from_file(nzb_path)?;
 
-            let files: Vec<FileInfo> = nzb.files().iter().map(|file| {
-                let filename = Nzb::get_filename_from_subject(&file.subject)
-                    .unwrap_or_else(|| file.subject.clone());
-                let size: u64 = file.segments.segment.iter().map(|s| s.bytes).sum();
-                let is_par2 = filename.to_lowercase().ends_with(".par2");
+            let files: Vec<FileInfo> = nzb
+                .files()
+                .iter()
+                .map(|file| {
+                    let filename = Nzb::get_filename_from_subject(&file.subject)
+                        .unwrap_or_else(|| file.subject.clone());
+                    let size: u64 = file.segments.segment.iter().map(|s| s.bytes).sum();
+                    let is_par2 = filename.to_lowercase().ends_with(".par2");
 
-                FileInfo {
-                    filename,
-                    size,
-                    segments: file.segments.segment.len(),
-                    is_par2,
-                }
-            }).collect();
+                    FileInfo {
+                        filename,
+                        size,
+                        segments: file.segments.segment.len(),
+                        is_par2,
+                    }
+                })
+                .collect();
 
             results.push(NzbInfo {
                 file: nzb_path.clone(),
@@ -304,7 +312,8 @@ async fn handle_download_mode(cli: &Cli, mut config: Config) -> Result<()> {
 
     // Update memory settings (from deprecated flags if present)
     if let Some(memory_mb) = cli.memory_limit {
-        config.memory.max_segments_in_memory = (memory_mb * 1024 * 1024) / 100_000; // Rough estimate
+        config.memory.max_segments_in_memory = (memory_mb * 1024 * 1024) / 100_000;
+        // Rough estimate
     }
     if let Some(buffer_kb) = cli.buffer_size {
         config.memory.io_buffer_size = buffer_kb * 1024;
@@ -365,14 +374,13 @@ async fn handle_download_mode(cli: &Cli, mut config: Config) -> Result<()> {
         download_config.download.dir = output_dir.clone();
         download_config.download.force_redownload = cli.force;
 
+        // Track timing for JSON output
+        let download_start = std::time::Instant::now();
+
         // Download the NZB with updated config
-        match downloader
-            .download_nzb(&nzb, download_config.clone())
-            .await
-        {
+        match downloader.download_nzb(&nzb, download_config.clone()).await {
             Ok((results, _progress_bar)) => {
-                // Keep the download progress bar visible
-                // Don't call finish_and_clear() - let it stay on screen
+                let download_time = download_start.elapsed();
 
                 if cli.print_names {
                     for result in &results {
@@ -380,25 +388,74 @@ async fn handle_download_mode(cli: &Cli, mut config: Config) -> Result<()> {
                     }
                 }
 
-                // Post-processing - create new progress bars
+                // Post-processing
+                let mut post_result = PostProcessingResult {
+                    par2_verified: false,
+                    par2_repaired: false,
+                    rar_extracted: false,
+                    files_renamed: 0,
+                };
+
                 if config.post_processing.auto_par2_repair
                     || config.post_processing.auto_extract_rar
                 {
-                    let processor = PostProcessor::new(download_config.post_processing.clone());
+                    let processor = PostProcessor::new(
+                        download_config.post_processing.clone(),
+                        download_config.tuning.large_file_threshold,
+                    );
                     if let Err(e) = processor.process_downloads(&results).await {
-                        eprintln!("Post-processing error: {}", e);
+                        if !cli.json {
+                            eprintln!("Post-processing error: {}", e);
+                        }
+                    } else {
+                        post_result.par2_verified = config.post_processing.auto_par2_repair;
+                        post_result.rar_extracted = config.post_processing.auto_extract_rar;
                     }
                 }
 
-                // Print final summary
-                print_final_summary(&nzb, &results, &output_dir);
+                // Output results
+                if cli.json {
+                    let total_size: u64 = results.iter().map(|r| r.size).sum();
+                    let summary = DownloadSummary {
+                        nzb: nzb_path.clone(),
+                        output_dir: output_dir.clone(),
+                        success: results.iter().all(|r| r.segments_failed == 0),
+                        total_size,
+                        download_time_seconds: download_time.as_secs_f64(),
+                        average_speed_mbps: if download_time.as_secs() > 0 {
+                            (total_size as f64 / 1024.0 / 1024.0) / download_time.as_secs_f64()
+                        } else {
+                            0.0
+                        },
+                        files: results
+                            .iter()
+                            .map(|r| DownloadFileResult {
+                                filename: r.filename.clone(),
+                                path: r.path.clone(),
+                                size: r.size,
+                                segments_downloaded: r.segments_downloaded,
+                                segments_failed: r.segments_failed,
+                                success: r.segments_failed == 0,
+                            })
+                            .collect(),
+                        post_processing: post_result,
+                    };
+                    println!("{}", serde_json::to_string_pretty(&summary)?);
+                } else {
+                    print_final_summary(&nzb, &results, &output_dir);
+                }
 
                 all_results.extend(results);
             }
             Err(e) => {
-                eprintln!("Download failed for {}: {}", nzb_path.display(), e);
-                if !cli.keep_partial {
-                    eprintln!("Note: Partial files may remain. Use --keep-partial to explicitly keep them.");
+                if cli.json {
+                    let error_output = ErrorOutput::from_error(&e);
+                    println!("{}", serde_json::to_string_pretty(&error_output)?);
+                } else {
+                    eprintln!("Download failed for {}: {}", nzb_path.display(), e);
+                    if !cli.keep_partial {
+                        eprintln!("Note: Partial files may remain. Use --keep-partial to explicitly keep them.");
+                    }
                 }
             }
         }
@@ -477,4 +534,3 @@ fn print_final_summary(
         );
     }
 }
-

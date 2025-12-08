@@ -1,36 +1,12 @@
 # dl-nzb
 
-A fast, modern NZB downloader written in Rust. 
-Downloads from Usenet with parallel connections, automatic repair and extraction, and a clean terminal interface.
+NZB downloader written in Rust. Downloads from Usenet with parallel connections, PAR2 repair, and RAR extraction.
 
-![CleanShot 2025-10-13 at 23 25 24](https://github.com/user-attachments/assets/34e25e25-6d83-4ffc-a19e-8fb2146792a0)
+Single binary, no external dependencies. PAR2 uses [par2-rs](https://github.com/zephleggett/par2-rs) (pure Rust with SIMD). RAR extraction built in.
 
-## Why dl-nzb?
+## Install
 
-Most Usenet downloaders are either slow, bloated with unnecessary features, or haven't been updated in years. dl-nzb is built from scratch in Rust to be fast and efficient without the overhead. 
-It does one thing well: download your NZB files as quickly as your connection allows.
-
-The entire downloader is a 2.5MB statically-linked binary with zero runtime dependencies. 
-PAR2 repair and RAR extraction are built directly into the binary using optimized C++ libraries (par2cmdline-turbo), so you don't need to install external tools. 
-
-It uses async I/O and connection pooling to maximize throughput, and it's smart about memory usage so you can run it on servers with limited RAM.
-
-Just copy the binary to your server and run it.
-
-## Features
-- Downloads with parallel connections and automatic retries. 
-- Built-in PAR2 verification and repair using par2cmdline-turbo (no external par2 command needed). 
-- Built-in RAR extraction (no external unrar needed). 
-- Handles obfuscated filenames. 
-- Configurable through a simple TOML file or command-line options.
-
-## Installation
-
-You may download the latest release here
-
-OR
-
-Build from source with Cargo:
+Download from [releases](https://github.com/zephleggett/dl-nzb/releases) or build from source:
 
 ```bash
 git clone https://github.com/zephleggett/dl-nzb.git
@@ -39,14 +15,20 @@ cargo build --release
 cp target/release/dl-nzb /usr/local/bin/
 ```
 
-## Quick Start
+## Setup
 
-On first run, dl-nzb creates a config file. Edit it with your Usenet server credentials:
+First run creates a config file. Add your Usenet credentials:
 
+```bash
+dl-nzb config  # shows config path
+```
+
+Config locations:
 - Linux: `~/.config/dl-nzb/config.toml`
 - macOS: `~/Library/Application Support/dl-nzb/config.toml`
 - Windows: `%APPDATA%\dl-nzb\config.toml`
 
+Minimal config:
 ```toml
 [usenet]
 server = "news.example.com"
@@ -54,141 +36,122 @@ port = 563
 username = "your-username"
 password = "your-password"
 ssl = true
-connections = 30
+connections = 20
 ```
 
-Then download any NZB:
+## Usage
 
 ```bash
-dl-nzb file.nzb
+dl-nzb file.nzb                    # download
+dl-nzb -o /path/to/dir file.nzb   # custom output dir
+dl-nzb -c 50 file.nzb             # more connections
+dl-nzb -l file.nzb                # list contents only
+dl-nzb test                        # test server connection
+dl-nzb --json file.nzb            # JSON output for scripting
 ```
 
-That's it. Files download to a `downloads/` folder in your current directory by default.
-
-## Usage Examples
-
-Download an NZB file:
+Skip post-processing:
 ```bash
-dl-nzb movie.nzb
+dl-nzb --no-par2 --no-extract-rar file.nzb
 ```
 
-Download to a specific directory:
+Clean up after extraction:
 ```bash
-dl-nzb -o /path/to/downloads movie.nzb
+dl-nzb --delete-rar-after-extract --delete-par2 file.nzb
 ```
 
-Use more connections for faster speeds:
-```bash
-dl-nzb -c 50 movie.nzb
-```
-
-List NZB contents without downloading:
-```bash
-dl-nzb -l movie.nzb
-```
-
-Skip automatic extraction and repair:
-```bash
-dl-nzb --no-extract-rar --no-par2 movie.nzb
-```
-
-Download and clean up archive files automatically:
-```bash
-dl-nzb --delete-rar-after-extract --delete-par2 movie.nzb
-```
-
-Test your server connection:
-```bash
-dl-nzb test
-```
-
-View your configuration:
-```bash
-dl-nzb config
-```
-
-## Configuration
-
-The config file lives at `~/.config/dl-nzb/config.toml`. You can also use a local `dl-nzb.toml` file in your working directory for project-specific settings.
-
-Here are the main options:
+## Config Reference
 
 ```toml
 [usenet]
-server = "news.example.com"  # Your Usenet provider
+server = "news.example.com"
 port = 563                    # 563 for SSL, 119 for plain
 username = "user"
 password = "pass"
 ssl = true
-connections = 30              # More = faster (check your provider's limits)
-timeout = 45
+verify_ssl_certs = true
+connections = 20              # check your provider's limit
+timeout = 30
 retry_attempts = 2
+retry_delay = 500
 
 [download]
-dir = "downloads"             # Where files go
-create_subfolders = true      # Create a folder for each NZB
+dir = "downloads"
+create_subfolders = true      # folder per NZB
+force_redownload = false
 
 [post_processing]
-auto_par2_repair = true       # Verify and repair with PAR2
-auto_extract_rar = true       # Extract RAR archives
+auto_par2_repair = true
+auto_extract_rar = true
 delete_rar_after_extract = false
 delete_par2_after_repair = false
-deobfuscate_file_names = true # Rename obfuscated files
+deobfuscate_file_names = true
 
 [memory]
-max_segments_in_memory = 100
-io_buffer_size = 8388608      # 8MB - good for most systems
-max_concurrent_files = 10
+max_segments_in_memory = 800
+io_buffer_size = 8388608      # 8MB
+max_concurrent_files = 100
+
+[tuning]
+pipeline_size = 50            # segments per batch
+connection_wait_timeout = 300 # seconds
+large_file_threshold = 10485760  # 10MB, for progress display
+
+[logging]
+level = "info"
+format = "pretty"
 ```
 
-All settings can be overridden via environment variables with the `DL_NZB_` prefix:
+Environment variables override config with `DL_NZB_` prefix:
+```bash
+DL_NZB_USENET_SERVER=news.example.com dl-nzb file.nzb
+```
+
+## CLI Options
+
+```
+dl-nzb [OPTIONS] <FILES>...
+dl-nzb <COMMAND>
+
+Commands:
+  test    Test server connection
+  config  Show config location
+
+Options:
+  -o, --output-dir <DIR>       Output directory
+  -c, --connections <NUM>      Connection count
+  -l, --list                   List NZB contents
+  -q, --quiet                  Suppress output
+  -v, --verbose                Verbose (-vv for trace)
+  --json                       JSON output
+  --no-par2                    Skip PAR2 repair
+  --no-extract-rar             Skip RAR extraction
+  --delete-rar-after-extract   Delete RARs after extract
+  --delete-par2                Delete PAR2 after repair
+  --no-directories             No subfolders
+  --force                      Re-download existing files
+  --keep-partial               Keep partial files on error
+  --print-names                Print filenames to stdout
+  --server <HOST>              Override server
+  --port <PORT>                Override port
+  -u, --user <USER>            Override username
+  -p, --password <PASS>        Override password
+```
+
+## JSON Output
+
+With `--json`, outputs structured data for scripting:
 
 ```bash
-DL_NZB_USENET_CONNECTIONS=50 dl-nzb movie.nzb
-```
-
-## Command-Line Options
-
-Run `dl-nzb --help` for the full list. Here are the most useful ones:
-
-```
--o, --output-dir <DIR>         Output directory
--c, --connections <NUM>        Number of connections
--l, --list                     List NZB contents without downloading
--q, --quiet                    Quiet mode
--v, --verbose                  Verbose output (use -vv for trace)
---no-par2                      Skip PAR2 repair
---no-extract-rar               Skip RAR extraction
---delete-rar-after-extract     Clean up RAR files after extraction
---delete-par2                  Clean up PAR2 files after repair
---no-directories               Don't create subfolders
---keep-partial                 Keep partial files on error
---memory-limit <MB>            Memory limit for segment buffering
---buffer-size <KB>             I/O buffer size (default 4096)
---max-concurrent-files <NUM>   Max concurrent file downloads
---log-level <LEVEL>            error, warn, info, debug, trace
---server <HOST>                Override Usenet server
---port <PORT>                  Override server port
--u, --user <USER>              Override username
--p, --password <PASS>          Override password (use - for stdin)
+dl-nzb --json -l file.nzb      # list as JSON
+dl-nzb --json file.nzb         # download results as JSON
+dl-nzb --json test             # test results as JSON
 ```
 
 ## Requirements
 
-Just a Usenet provider with NNTP access. That's it.
-
-PAR2 repair and RAR extraction are compiled directly into the binary, so there's nothing else to install. The binary is statically linked and includes all the necessary code from par2cmdline-turbo for verification and repair.
-
-## Performance
-
-dl-nzb is designed to max out your connection speed. It uses async I/O, connection pooling, and streaming writes to disk. On a gigabit connection with 30-50 connections, you should see speeds close to your line capacity.
-
-Memory usage is configurable but defaults are tuned for typical systems (around 100-200MB during downloads). Increase `max_segments_in_memory` if you have RAM to spare and want slightly better performance.
+Usenet provider with NNTP access. Nothing else to install.
 
 ## License
 
-GPL 2.0
-
-## Contributing
-
-Pull requests welcome. This is a side project to get started in rust, but I'll review contributions when I can.
+GPL-2.0

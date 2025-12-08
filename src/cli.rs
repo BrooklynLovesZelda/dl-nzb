@@ -156,7 +156,9 @@ impl Cli {
             eprintln!("Warning: --connections is deprecated, set 'connections' in config file");
         }
         if cli.no_par2 {
-            eprintln!("Warning: --no-par2 is deprecated, set 'auto_par2_repair = false' in config file");
+            eprintln!(
+                "Warning: --no-par2 is deprecated, set 'auto_par2_repair = false' in config file"
+            );
         }
         if cli.no_extract_rar {
             eprintln!("Warning: --no-extract-rar is deprecated, set 'auto_extract_rar = false' in config file");

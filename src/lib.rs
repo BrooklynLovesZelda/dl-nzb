@@ -29,8 +29,9 @@
 pub mod cli;
 pub mod config;
 pub mod error;
-pub mod progress;
 pub mod json_output;
+pub mod patterns;
+pub mod progress;
 
 // Feature modules organized by functionality
 pub mod download;

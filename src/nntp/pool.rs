@@ -12,6 +12,9 @@ use deadpool::managed::{Manager, Pool, RecycleResult};
 use std::sync::Arc;
 use tokio::time::Duration;
 
+/// Maximum concurrent connection creation attempts to avoid overwhelming the server
+const MAX_CONCURRENT_CONNECTION_CREATION: usize = 10;
+
 /// Connection manager for deadpool with rate-limited creation
 pub struct NntpConnectionManager {
     config: Arc<UsenetConfig>,
@@ -39,8 +42,9 @@ impl NntpConnectionManager {
         };
 
         // Rate limit connection creation to avoid overwhelming server
-        // Allow up to 10 connections to be created concurrently
-        let creation_semaphore = Arc::new(tokio::sync::Semaphore::new(10));
+        let creation_semaphore = Arc::new(tokio::sync::Semaphore::new(
+            MAX_CONCURRENT_CONNECTION_CREATION,
+        ));
 
         Ok(Self {
             config: Arc::new(config),
@@ -67,7 +71,7 @@ impl Manager for NntpConnectionManager {
         AsyncNntpConnection::connect(&self.config, self.tls_connector.clone())
             .await
             .map_err(|e| {
-                tracing::error!("Failed to create NNTP connection: {}", e);
+                tracing::debug!("Failed to create NNTP connection: {}", e);
                 e
             })
     }
@@ -103,9 +107,7 @@ impl PooledConnection {
         message_id: &str,
         group: &str,
     ) -> Result<Bytes, DlNzbError> {
-        self.conn
-            .download_segment(message_id, group)
-            .await
+        self.conn.download_segment(message_id, group).await
     }
 
     /// Download multiple segments using pipelining
@@ -130,7 +132,7 @@ impl NntpPoolBuilder {
             max_size: config.connections as usize,
             config,
             timeouts: deadpool::managed::Timeouts {
-                wait: Some(Duration::from_secs(120)), // Longer wait for high-speed pipelining
+                wait: Some(Duration::from_secs(30)), // Reduced from 120s for faster failure
                 create: Some(Duration::from_secs(30)),
                 recycle: Some(Duration::from_secs(5)),
             },
@@ -176,7 +178,7 @@ pub trait NntpPoolExt {
 impl NntpPoolExt for NntpPool {
     async fn get_connection(&self) -> Result<PooledConnection, DlNzbError> {
         let conn = self.get().await.map_err(|e| {
-            tracing::error!("Failed to get connection from pool: {}", e);
+            tracing::debug!("Failed to get connection from pool: {}", e);
             NntpError::ConnectionFailed {
                 server: "pool".to_string(),
                 port: 0,
