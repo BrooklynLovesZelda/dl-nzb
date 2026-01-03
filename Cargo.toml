@@ -37,13 +37,8 @@ inherits = "release"
 opt-level = 3       # Maximum speed optimization
 lto = "thin"        # Faster LTO, good balance
 
-[features]
-# Enable vendored OpenSSL for cross-compilation
-vendored-openssl = ["openssl/vendored"]
 
 [dependencies]
-# OpenSSL (explicit dependency for vendored feature support)
-openssl = { version = "0.10", optional = false }
 # Async runtime and networking
 tokio = { version = "1.45", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros", "fs"] }
 tokio-util = { version = "0.7", features = ["io", "codec"] }
@@ -89,4 +84,7 @@ tempfile = "3.20"
 unrar = "0.5"
 
 # PAR2 support (pure Rust with SIMD optimizations)
-par2-rs = { path = "../par2-rs" }
+par2-rs = { package = "par2rs", path = "../par2rs-local" }
+
+[target.'cfg(not(windows))'.dependencies]
+openssl = { version = "0.10", features = ["vendored"] }

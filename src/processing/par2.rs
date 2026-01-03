@@ -1,15 +1,15 @@
 //! PAR2 verification and repair functionality
 
 use indicatif::ProgressBar;
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use crate::config::PostProcessingConfig;
-use crate::error::{DlNzbError, PostProcessingError};
-use crate::patterns::par2 as par2_patterns;
+use crate::error::DlNzbError;
 use crate::progress;
-use par2_rs::{MessageCallback, MessageLevel, Par2Operation, Par2Repairer, ProgressCallback};
+use par2_rs::repair::{
+    repair_files, FileStatus, ProgressReporter, RecoverySetInfo, RepairResult, VerificationResult,
+};
+use par2_rs::verify::VerificationConfig;
 
 type Result<T> = std::result::Result<T, DlNzbError>;
 
@@ -24,211 +24,114 @@ pub enum Par2Status {
     Failed,
 }
 
+/// Bridge between indicatif::ProgressBar and par2_rs::ProgressReporter
+struct Par2ProgressReporter {
+    pb: ProgressBar,
+}
+
+impl Par2ProgressReporter {
+    fn new(pb: ProgressBar) -> Self {
+        Self { pb }
+    }
+}
+
+impl ProgressReporter for Par2ProgressReporter {
+    fn report_statistics(&self, _recovery_set: &RecoverySetInfo) {}
+    fn report_file_opening(&self, _file_name: &str) {}
+    fn report_file_status(&self, _file_name: &str, _status: FileStatus) {}
+    fn report_scanning(&self, file_name: &str) {
+        self.pb.set_message(format!("Scanning: {}", file_name));
+        progress::apply_style(&self.pb, progress::ProgressStyle::Par2);
+    }
+    fn report_scanning_progress(&self, _file_name: &str, bytes_processed: u64, total_bytes: u64) {
+        self.pb.set_length(total_bytes);
+        self.pb.set_position(bytes_processed);
+    }
+    fn clear_scanning(&self, _file_name: &str) {}
+    fn report_recovery_info(&self, _available: usize, _needed: usize) {}
+    fn report_insufficient_recovery(&self, _available: usize, _needed: usize) {}
+    fn report_repair_header(&self) {}
+    fn report_loading_progress(&self, _files_loaded: usize, _total_files: usize) {}
+    fn report_constructing(&self) {
+        self.pb.set_message("Constructing repair matrix...");
+    }
+    fn report_computing_progress(&self, blocks_processed: usize, total_blocks: usize) {
+        self.pb.set_message("Repairing...");
+        self.pb.set_length(total_blocks as u64);
+        self.pb.set_position(blocks_processed as u64);
+        progress::apply_style(&self.pb, progress::ProgressStyle::Par2Repair);
+    }
+    fn report_repair_start(&self, file_name: &str) {
+        self.pb.set_message(format!("Repairing: {}", file_name));
+    }
+    fn report_writing_progress(&self, _file_name: &str, bytes_written: u64, total_bytes: u64) {
+        self.pb.set_length(total_bytes);
+        self.pb.set_position(bytes_written);
+    }
+    fn report_repair_complete(&self, _file_name: &str, _repaired: bool) {}
+    fn report_repair_failed(&self, _file_name: &str, _error: &str) {}
+    fn report_verification_header(&self) {}
+    fn report_verification(&self, file_name: &str, _result: VerificationResult) {
+        self.pb.set_message(format!("Verified: {}", file_name));
+        progress::apply_style(&self.pb, progress::ProgressStyle::Par2Verify);
+    }
+    fn report_final_result(&self, _result: &RepairResult) {}
+}
+
 /// Run PAR2 verification and repair on downloaded files
 pub async fn repair_with_par2(
     config: &PostProcessingConfig,
-    download_dir: &Path,
+    _download_dir: &Path,
     downloaded_par2_files: &[PathBuf],
     progress_bar: &ProgressBar,
 ) -> Result<Par2Status> {
-    progress_bar.set_message("Searching for PAR2 files...");
-
     if downloaded_par2_files.is_empty() {
         progress_bar.finish_and_clear();
         return Ok(Par2Status::NoPar2Files);
     }
 
-    // Get list of files before PAR2 repair (to detect renames)
-    let files_before: HashSet<String> = std::fs::read_dir(download_dir)?
-        .filter_map(|entry| entry.ok())
-        .map(|entry| entry.file_name().to_string_lossy().to_string())
-        .collect();
-
-    let mut par2_files = downloaded_par2_files.to_vec();
-
-    // Count total files to scan for progress tracking
-    let total_files = files_before.len() as u64;
-    progress_bar.set_length(total_files);
-    progress::apply_style(progress_bar, progress::ProgressStyle::Par2);
-
     // Find the main PAR2 file (index file without .vol)
-    let main_par2 = if let Some(main) = par2_files.iter().find(|p| par2_patterns::is_main_par2(p)) {
-        main
-    } else {
-        // Fall back to smallest file
-        par2_files.sort_by_key(|p| p.metadata().ok().map(|m| m.len()).unwrap_or(u64::MAX));
-        par2_files
-            .first()
-            .ok_or_else(|| PostProcessingError::Par2(par2_rs::Par2Error::NotFound))?
-    };
+    // We use the first PAR2 file provided as the entry point
+    let main_par2 = downloaded_par2_files.first().ok_or_else(|| {
+        DlNzbError::PostProcessing(crate::error::PostProcessingError::NoRarArchives)
+    })?; // Fix this later with better error
 
-    progress_bar.set_position(0);
-    progress_bar.set_message("Verifying files...");
+    let reporter =
+        Box::new(Par2ProgressReporter::new(progress_bar.clone())) as Box<dyn ProgressReporter>;
+    let verify_config = VerificationConfig::for_repair(0, true);
 
-    let repairer = Par2Repairer::new(main_par2).map_err(PostProcessingError::Par2)?;
+    // Use spawn_blocking since repair_files is synchronous
+    let main_par2_str = main_par2.to_string_lossy().to_string();
+    let result =
+        tokio::task::spawn_blocking(move || repair_files(&main_par2_str, reporter, &verify_config))
+            .await
+            .map_err(|e| DlNzbError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
 
-    // Track counts for live status updates
-    #[derive(Default)]
-    struct Par2Counts {
-        damaged: usize,
-        missing: usize,
-        obfuscated: usize,
-        repaired: usize,
-    }
-    let counts = Arc::new(std::sync::Mutex::new(Par2Counts::default()));
-    let messages: Arc<std::sync::Mutex<Vec<(MessageLevel, String)>>> =
-        Arc::new(std::sync::Mutex::new(Vec::new()));
+    match result {
+        Ok((_context, repair_result)) => {
+            progress_bar.finish_and_clear();
 
-    // Progress callback updates the progress bar
-    let pb_clone = progress_bar.clone();
-    let counts_for_progress = counts.clone();
-    let progress_callback: ProgressCallback = Arc::new(move |operation, current, total| {
-        pb_clone.set_length(total);
-        pb_clone.set_position(current);
-
-        match operation {
-            Par2Operation::Scanning => {
-                pb_clone.set_message("Scanning files...");
-                progress::apply_style(&pb_clone, progress::ProgressStyle::Par2);
-            }
-            Par2Operation::Loading => {
-                pb_clone.set_message("Loading PAR2 data...");
-                progress::apply_style(&pb_clone, progress::ProgressStyle::Par2);
-            }
-            Par2Operation::Verifying => {
-                if let Ok(c) = counts_for_progress.lock() {
-                    let mut parts = Vec::new();
-                    if c.obfuscated > 0 {
-                        parts.push(format!("{} found", c.obfuscated));
+            match repair_result {
+                RepairResult::Success { .. } | RepairResult::NoRepairNeeded { .. } => {
+                    // Delete PAR2 files if configured
+                    if config.delete_par2_after_repair {
+                        for par2_path in downloaded_par2_files {
+                            if par2_path.exists() {
+                                let _ = std::fs::remove_file(par2_path);
+                            }
+                        }
                     }
-                    if c.damaged > 0 {
-                        parts.push(format!("{} damaged", c.damaged));
-                    }
-                    if c.missing > 0 {
-                        parts.push(format!("{} missing", c.missing));
-                    }
-                    if parts.is_empty() {
-                        pb_clone.set_message("Verifying...");
-                    } else {
-                        pb_clone.set_message(format!("Verifying... ({})", parts.join(", ")));
-                    }
-                } else {
-                    pb_clone.set_message("Verifying...");
+                    println!("  └─ \x1b[33m✓ PAR2 verified\x1b[0m");
+                    Ok(Par2Status::Success)
                 }
-                progress::apply_style(&pb_clone, progress::ProgressStyle::Par2Verify);
-            }
-            Par2Operation::Repairing => {
-                pb_clone.set_message("Repairing...");
-                progress::apply_style(&pb_clone, progress::ProgressStyle::Par2Repair);
-            }
-        }
-    });
-
-    // Message callback collects messages and updates counts
-    // Note: Message patterns are coupled to par2-rs message format
-    let messages_clone = messages.clone();
-    let counts_clone = counts.clone();
-    let message_callback: MessageCallback = Arc::new(move |level, message| {
-        if let Ok(mut msgs) = messages_clone.lock() {
-            msgs.push((level, message.to_string()));
-        }
-
-        if let Ok(mut c) = counts_clone.lock() {
-            match level {
-                MessageLevel::Warning if message.contains("damaged") => c.damaged += 1,
-                MessageLevel::Error if message.contains("Missing") => c.missing += 1,
-                MessageLevel::Info if message.contains("obfuscated") => c.obfuscated += 1,
-                MessageLevel::Info if message.contains("Repairing") => c.repaired += 1,
-                _ => {}
-            }
-        }
-    });
-
-    match repairer.repair_with_callbacks(
-        true,
-        false,
-        Some(progress_callback),
-        Some(message_callback),
-    ) {
-        Ok(()) => {
-            progress_bar.set_position(total_files);
-
-            // Check if any files were renamed
-            let files_after: HashSet<String> = std::fs::read_dir(download_dir)?
-                .filter_map(|entry| entry.ok())
-                .map(|entry| entry.file_name().to_string_lossy().to_string())
-                .collect();
-
-            let renamed_count = files_before.symmetric_difference(&files_after).count() / 2;
-
-            // Delete PAR2 files if configured
-            if config.delete_par2_after_repair {
-                for par2_path in downloaded_par2_files {
-                    if par2_path.exists() {
-                        let _ = std::fs::remove_file(par2_path);
-                    }
+                RepairResult::Failed { message, .. } => {
+                    println!("  └─ \x1b[31m✗ PAR2 failed: {}\x1b[0m", message);
+                    Ok(Par2Status::Failed)
                 }
             }
-
-            progress_bar.finish_with_message("  ");
-
-            // Build summary from counts
-            let mut summary_parts = Vec::new();
-            if renamed_count > 0 {
-                summary_parts.push(format!("{} renamed", renamed_count));
-            }
-            if let Ok(c) = counts.lock() {
-                if c.obfuscated > 0 {
-                    summary_parts.push(format!("{} deobfuscated", c.obfuscated));
-                }
-                if c.repaired > 0 {
-                    summary_parts.push(format!("{} repaired", c.repaired));
-                }
-            }
-
-            if summary_parts.is_empty() {
-                println!("  └─ \x1b[33m✓ PAR2 verified\x1b[0m");
-            } else {
-                println!(
-                    "  └─ \x1b[33m✓ PAR2 verified ({})\x1b[0m",
-                    summary_parts.join(", ")
-                );
-            }
-
-            Ok(Par2Status::Success)
         }
         Err(e) => {
-            let error_msg = e.to_string();
-
-            progress::apply_style(progress_bar, progress::ProgressStyle::Par2Error);
-            progress_bar.finish_with_message("  ");
-
-            if let Ok(c) = counts.lock() {
-                let mut issue_parts = Vec::new();
-                if c.damaged > 0 {
-                    issue_parts.push(format!("{} damaged", c.damaged));
-                }
-                if c.missing > 0 {
-                    issue_parts.push(format!("{} missing", c.missing));
-                }
-
-                if !issue_parts.is_empty() {
-                    println!(
-                        "  \x1b[33m⚠ {} files with issues\x1b[0m",
-                        issue_parts.join(", ")
-                    );
-                }
-            }
-
-            let short_error = if error_msg.contains("Need") && error_msg.contains("recovery blocks")
-            {
-                "Not enough recovery data to repair"
-            } else {
-                &error_msg
-            };
-
-            println!("  └─ \x1b[31m✗ PAR2 failed: {}\x1b[0m", short_error);
-
+            println!("  └─ \x1b[31m✗ PAR2 failed: {}\x1b[0m", e);
             Ok(Par2Status::Failed)
         }
     }
